@@ -39,7 +39,8 @@ type Outbound struct {
 	ctx            context.Context
 	logger         logger.ContextLogger
 	network        adapter.NetworkManager
-	dialer         dialer.ParallelInterfaceDialer
+	dialer         N.Dialer
+	detour         string
 	domainStrategy C.DomainStrategy
 	fallbackDelay  time.Duration
 	isEmpty        bool
@@ -48,9 +49,6 @@ type Outbound struct {
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
 	options.UDPFragmentDefault = true
-	if options.Detour != "" {
-		return nil, E.New("`detour` is not supported in direct context")
-	}
 	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
 		Context:        ctx,
 		Options:        options.DialerOptions,
@@ -68,7 +66,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		//nolint:staticcheck
 		domainStrategy: C.DomainStrategy(options.DomainStrategy),
 		fallbackDelay:  time.Duration(options.FallbackDelay),
-		dialer:         outboundDialer.(dialer.ParallelInterfaceDialer),
+		dialer:         outboundDialer,
+		detour:         options.Detour,
 		isEmpty:        reflect.DeepEqual(options.DialerOptions, option.DialerOptions{UDPFragmentDefault: true}),
 	}
 	//nolint:staticcheck
@@ -149,6 +148,10 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (h *Outbound) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	if h.detour != "" {
+		// Kernel direct routing cannot be forwarded through a proxy detour.
+		return nil, E.New("direct route is not supported with detour: ", h.detour)
+	}
 	ctx := log.ContextWithNewID(h.ctx)
 	destination, err := ping.ConnectDestination(ctx, h.logger, common.MustCast[*dialer.DefaultDialer](h.dialer).DialerForICMPDestination(metadata.Destination.Addr).Control, metadata.Destination.Addr, routeContext, timeout)
 	if err != nil {
@@ -172,7 +175,11 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
+	if parallelDialer, isParallel := h.dialer.(dialer.ParallelInterfaceDialer); isParallel {
+		return dialer.DialParallelNetwork(ctx, parallelDialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
+	}
+	// DetourDialer only implements N.Dialer; keep address-family racing through the generic helper.
+	return N.DialParallel(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), h.fallbackDelay)
 }
 
 func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
@@ -189,7 +196,11 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, dest
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+	if parallelDialer, isParallel := h.dialer.(dialer.ParallelInterfaceDialer); isParallel {
+		return dialer.DialParallelNetwork(ctx, parallelDialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+	}
+	// Interface selection belongs to the detour target when the local dialer is not interface-aware.
+	return N.DialParallel(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), fallbackDelay)
 }
 
 func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
