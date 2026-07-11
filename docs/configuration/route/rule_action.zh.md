@@ -130,6 +130,7 @@ icon: material/new-box
   "action": "route-options",
   "override_address": "",
   "override_port": 0,
+  "clear_resolved": false,
   "network_strategy": "",
   "fallback_delay": "",
   "udp_disable_domain_unmapping": false,
@@ -151,6 +152,13 @@ icon: material/new-box
 #### override_port
 
 覆盖目标端口。
+
+#### clear_resolved
+
+在当前规则完成匹配后清除先前解析得到的目标地址，同时保留原始域名目标。
+
+这样，IP/GeoIP 规则可以先使用 `resolve` 动作产生的地址完成匹配，随后由选中的出站
+按照自身的域名解析策略重新解析原始域名。当当前目标本身已经是 IP 地址时，此选项不生效。
 
 #### network_strategy
 

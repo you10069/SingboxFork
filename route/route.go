@@ -468,6 +468,12 @@ match:
 			routeOptions = action
 		}
 		if routeOptions != nil {
+			// Clear addresses only after the current rule has matched, so IP rules can
+			// use the resolved addresses while the selected outbound receives the
+			// original domain and may resolve it again with its own strategy.
+			if routeOptions.ClearResolved && metadata.Destination.IsDomain() {
+				metadata.DestinationAddresses = nil
+			}
 			// TODO: add nat
 			if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
 				metadata.RouteOriginalDestination = metadata.Destination
