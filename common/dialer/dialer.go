@@ -50,9 +50,9 @@ func New(ctx context.Context, options option.DialerOptions) (N.Dialer, error) {
 	return dialer, nil
 }
 
-func NewDirect(ctx context.Context, options option.DialerOptions) (ParallelInterfaceDialer, error) {
+func NewDirect(ctx context.Context, options option.DialerOptions) (N.Dialer, error) {
 	if options.Detour != "" {
-		return nil, E.New("`detour` is not supported in direct context")
+		return New(ctx, options)
 	}
 	if options.IsWireGuardListener {
 		return NewDefault(ctx, options)
