@@ -406,7 +406,7 @@ match:
 			// Clear addresses only after the current rule has matched, so IP rules can
 			// use the resolved addresses while the selected outbound receives the
 			// original domain and may resolve it again with its own strategy.
-			if routeOptions.ClearResolved && metadata.Destination.IsDomain() {
+			if routeOptions.ClearResolved && metadata.Destination.IsFqdn() {
 				metadata.DestinationAddresses = nil
 			}
 			// TODO: add nat
