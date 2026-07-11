@@ -86,6 +86,7 @@ Not available when `method` is set to drop.
   "action": "route-options",
   "override_address": "",
   "override_port": 0,
+  "clear_resolved": false,
   "network_strategy": "",
   "fallback_delay": "",
   "udp_disable_domain_unmapping": false,
@@ -106,6 +107,15 @@ Override the connection destination address.
 #### override_port
 
 Override the connection destination port.
+
+#### clear_resolved
+
+Clear previously resolved destination addresses after the current rule has matched,
+while preserving the original domain destination.
+
+This allows an IP/GeoIP rule to match addresses produced by a previous `resolve` action,
+then lets the selected outbound resolve the original domain again with its own strategy.
+It has no effect when the current destination is already an IP address.
 
 #### network_strategy
 
