@@ -122,12 +122,25 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		return os.ErrInvalid
 	}
 
+	m.access.Lock()
+	_, exists := m.providerByTag[tag]
+	m.access.Unlock()
+	if exists {
+		return E.New("provider already exists: ", tag)
+	}
+
 	provider, err := m.registry.CreateProvider(ctx, router, logFactory, tag, providerType, options)
 	if err != nil {
 		return err
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
+	// Protect against concurrent creation even though configuration startup is
+	// normally single-threaded.
+	if _, exists = m.providerByTag[tag]; exists {
+		_ = common.Close(provider)
+		return E.New("provider already exists: ", tag)
+	}
 	if m.started {
 		for _, stage := range adapter.ListStartStages {
 			if stage > m.stage {
@@ -139,22 +152,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 				return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
 			}
 		}
-	}
-	if existsProvider, loaded := m.providerByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsProvider)
-			if err != nil {
-				_ = common.Close(provider)
-				return E.Cause(err, "close provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.providers, func(it adapter.Provider) bool {
-			return it == existsProvider
-		})
-		if existsIndex == -1 {
-			panic("invalid provider index")
-		}
-		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider

@@ -137,6 +137,24 @@ func (a *Adapter) UpdateOutbounds(oldOptions []option.Outbound, newOptions []opt
 		newIndexByTag[tag] = index
 	}
 
+	// A Provider may replace only outbounds it already owns. Without this
+	// preflight check, a subscription node such as provider/node could silently
+	// replace a statically configured outbound or a node owned by another Provider.
+	a.outboundsAccess.RLock()
+	ownedTags := make(map[string]struct{}, len(a.outboundsByTag))
+	for tag := range a.outboundsByTag {
+		ownedTags[tag] = struct{}{}
+	}
+	a.outboundsAccess.RUnlock()
+	for tag := range newIndexByTag {
+		if _, owned := ownedTags[tag]; owned {
+			continue
+		}
+		if _, exists := a.outbound.Outbound(tag); exists {
+			return nil, E.New("provider outbound tag conflicts with existing outbound: ", tag)
+		}
+	}
+
 	creationOrder, dependencies, err := providerCreationOrder(a.providerTag, preparedOptions)
 	if err != nil {
 		return nil, err
