@@ -3,7 +3,9 @@ package remote
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"io"
 	"net"
 	"net/http"
@@ -45,6 +47,7 @@ type ProviderRemote struct {
 	logger       log.ContextLogger
 	outbound     adapter.OutboundManager
 	cacheFile    adapter.CacheFile
+	cacheKey     string
 	dialer       N.Dialer
 	tickerAccess sync.Mutex
 	ticker       *time.Ticker
@@ -93,6 +96,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		cancel:            cancel,
 		logger:            logger,
 		outbound:          outboundManager,
+		cacheKey:          providerCacheKey(tag, options.URL),
 		url:               options.URL,
 		userAgent:         userAgent,
 		downloadDetour:    options.DownloadDetour,
@@ -107,7 +111,7 @@ func (s *ProviderRemote) Start() error {
 	s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
 	loadedCache := false
 	if s.cacheFile != nil {
-		if savedSubscription := s.cacheFile.LoadSubscription(s.Tag()); savedSubscription != nil {
+		if savedSubscription := s.cacheFile.LoadSubscription(s.cacheKey); savedSubscription != nil {
 			if err := s.restoreCache(savedSubscription); err != nil {
 				s.logger.Warn(E.Cause(err, "restore cached outbound provider"))
 			} else {
@@ -270,7 +274,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		s.lastUpdated = now
 		s.stateAccess.Unlock()
 		if s.cacheFile != nil {
-			savedSubscription := s.cacheFile.LoadSubscription(s.Tag())
+			savedSubscription := s.cacheFile.LoadSubscription(s.cacheKey)
 			if savedSubscription != nil {
 				if hasInfo {
 					separator := bytes.IndexByte(savedSubscription.Content, '\n')
@@ -281,7 +285,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 					}
 				}
 				savedSubscription.LastUpdated = now
-				if err := s.cacheFile.SaveSubscription(s.Tag(), savedSubscription); err != nil {
+				if err := s.cacheFile.SaveSubscription(s.cacheKey, savedSubscription); err != nil {
 					s.logger.Error("save outbound provider cache file: ", err)
 				}
 			}
@@ -326,7 +330,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		if hasInfo {
 			cacheContent = append([]byte(infoString+"\n"), cacheContent...)
 		}
-		if err := s.cacheFile.SaveSubscription(s.Tag(), &adapter.SavedBinary{
+		if err := s.cacheFile.SaveSubscription(s.cacheKey, &adapter.SavedBinary{
 			Content:     cacheContent,
 			LastUpdated: now,
 			LastEtag:    lastEtag,
@@ -336,6 +340,11 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	}
 	s.logger.Info("updated outbound provider ", s.Tag())
 	return nil
+}
+
+func providerCacheKey(tag string, rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return F.ToString(tag, "#", hex.EncodeToString(sum[:]))
 }
 
 func (s *ProviderRemote) loopUpdate() {
