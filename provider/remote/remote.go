@@ -30,6 +30,11 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+const (
+	providerRequestTimeout  = 30 * time.Second
+	maxProviderResponseSize = 16 << 20
+)
+
 func RegisterProvider(registry *adapterProvider.Registry) {
 	adapterProvider.Register[option.ProviderRemoteOptions](registry, C.ProviderTypeRemote, NewProviderRemote)
 }
@@ -210,6 +215,9 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	}
 	defer s.updating.Store(false)
 
+	requestContext, cancel := context.WithTimeout(ctx, providerRequestTimeout)
+	defer cancel()
+
 	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
 	transport := &http.Transport{
 		ForceAttemptHTTP2:   true,
@@ -223,7 +231,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		},
 	}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport, Timeout: providerRequestTimeout}
 
 	s.stateAccess.RLock()
 	lastEtag := s.lastEtag
@@ -232,7 +240,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	var response *http.Response
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
+		request, requestErr := http.NewRequestWithContext(requestContext, http.MethodGet, s.url, nil)
 		if requestErr != nil {
 			return requestErr
 		}
@@ -244,13 +252,13 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		if err == nil {
 			break
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if requestContext.Err() != nil {
+			return requestContext.Err()
 		}
 		if attempt < 2 {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-requestContext.Done():
+				return requestContext.Err()
 			case <-time.After(time.Second):
 			}
 		}
@@ -297,7 +305,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		return E.New("unexpected status: ", response.Status)
 	}
 
-	contentRaw, err := io.ReadAll(response.Body)
+	contentRaw, err := readProviderResponse(response.Body, response.ContentLength)
 	if err != nil {
 		return err
 	}
@@ -340,6 +348,20 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	}
 	s.logger.Info("updated outbound provider ", s.Tag())
 	return nil
+}
+
+func readProviderResponse(reader io.Reader, contentLength int64) ([]byte, error) {
+	if contentLength > maxProviderResponseSize {
+		return nil, E.New("provider response exceeds 16 MiB")
+	}
+	content, err := io.ReadAll(io.LimitReader(reader, maxProviderResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxProviderResponseSize {
+		return nil, E.New("provider response exceeds 16 MiB")
+	}
+	return content, nil
 }
 
 func providerCacheKey(tag string, rawURL string) string {
