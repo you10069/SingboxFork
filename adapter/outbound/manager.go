@@ -171,7 +171,7 @@ func (m *Manager) Close() error {
 func (m *Manager) Outbounds() []adapter.Outbound {
 	m.access.Lock()
 	defer m.access.Unlock()
-	return m.outbounds
+	return append([]adapter.Outbound(nil), m.outbounds...)
 }
 
 func (m *Manager) Outbound(tag string) (adapter.Outbound, bool) {
@@ -201,12 +201,19 @@ func (m *Manager) Remove(tag string) error {
 		m.access.Unlock()
 		return os.ErrInvalid
 	}
+	dependBy := append([]string(nil), m.dependByTag[tag]...)
+	if len(dependBy) > 0 {
+		m.access.Unlock()
+		return E.New("outbound[", tag, "] is depended by ", strings.Join(dependBy, ", "))
+	}
 	delete(m.outboundByTag, tag)
+	delete(m.dependByTag, tag)
 	index := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 		return it == outbound
 	})
 	if index == -1 {
-		panic("invalid inbound index")
+		m.access.Unlock()
+		panic("invalid outbound index")
 	}
 	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
 	started := m.started
@@ -218,25 +225,25 @@ func (m *Manager) Remove(tag string) error {
 			m.defaultOutbound = nil
 		}
 	}
-	dependBy := m.dependByTag[tag]
-	if len(dependBy) > 0 {
-		return E.New("outbound[", tag, "] is depended by ", strings.Join(dependBy, ", "))
-	}
-	dependencies := outbound.Dependencies()
-	for _, dependency := range dependencies {
-		if len(m.dependByTag[dependency]) == 1 {
-			delete(m.dependByTag, dependency)
-		} else {
-			m.dependByTag[dependency] = common.Filter(m.dependByTag[dependency], func(it string) bool {
-				return it != tag
-			})
-		}
-	}
+	m.removeDependencyReferencesLocked(tag, outbound.Dependencies())
 	m.access.Unlock()
 	if started {
 		return common.Close(outbound)
 	}
 	return nil
+}
+
+func (m *Manager) removeDependencyReferencesLocked(tag string, dependencies []string) {
+	for _, dependency := range dependencies {
+		dependents := m.dependByTag[dependency]
+		if len(dependents) <= 1 {
+			delete(m.dependByTag, dependency)
+			continue
+		}
+		m.dependByTag[dependency] = common.Filter(dependents, func(it string) bool {
+			return it != tag
+		})
+	}
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
@@ -251,8 +258,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	defer m.access.Unlock()
 	if m.started {
 		for _, stage := range adapter.ListStartStages {
+			if stage > m.stage {
+				break
+			}
 			err = adapter.LegacyStart(outbound, stage)
 			if err != nil {
+				_ = common.Close(outbound)
 				return E.Cause(err, stage, " outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 			}
 		}
@@ -261,14 +272,16 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 		if m.started {
 			err = common.Close(existsOutbound)
 			if err != nil {
+				_ = common.Close(outbound)
 				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
 			}
 		}
+		m.removeDependencyReferencesLocked(tag, existsOutbound.Dependencies())
 		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 			return it == existsOutbound
 		})
 		if existsIndex == -1 {
-			panic("invalid inbound index")
+			panic("invalid outbound index")
 		}
 		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
 	}
@@ -276,7 +289,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	m.outboundByTag[tag] = outbound
 	dependencies := outbound.Dependencies()
 	for _, dependency := range dependencies {
-		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
+		if !common.Contains(m.dependByTag[dependency], tag) {
+			m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
+		}
 	}
 	if tag == m.defaultTag || (m.defaultTag == "" && m.defaultOutbound == nil) {
 		m.defaultOutbound = outbound

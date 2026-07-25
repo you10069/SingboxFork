@@ -23,12 +23,14 @@ var (
 	bucketExpand   = []byte("group_expand")
 	bucketMode     = []byte("clash_mode")
 	bucketRuleSet  = []byte("rule_set")
+	bucketProvider = []byte("provider")
 
 	bucketNameList = []string{
 		string(bucketSelected),
 		string(bucketExpand),
 		string(bucketMode),
 		string(bucketRuleSet),
+		string(bucketProvider),
 		string(bucketRDRC),
 	}
 
@@ -314,5 +316,44 @@ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
 			return err
 		}
 		return bucket.Put([]byte(tag), setBinary)
+	})
+}
+
+func (c *CacheFile) LoadSubscription(tag string) *adapter.SavedBinary {
+	if c.DB == nil {
+		return nil
+	}
+	var saved adapter.SavedBinary
+	err := c.DB.View(func(transaction *bbolt.Tx) error {
+		bucket := c.bucket(transaction, bucketProvider)
+		if bucket == nil {
+			return os.ErrNotExist
+		}
+		content := bucket.Get([]byte(tag))
+		if len(content) == 0 {
+			return os.ErrNotExist
+		}
+		return saved.UnmarshalBinary(content)
+	})
+	if err != nil {
+		return nil
+	}
+	return &saved
+}
+
+func (c *CacheFile) SaveSubscription(tag string, subscription *adapter.SavedBinary) error {
+	if c.DB == nil {
+		return os.ErrClosed
+	}
+	content, err := subscription.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	return c.DB.Batch(func(transaction *bbolt.Tx) error {
+		bucket, err := c.createBucket(transaction, bucketProvider)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(tag), content)
 	})
 }

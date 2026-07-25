@@ -1,0 +1,26 @@
+# Files changed or added for the Providers backport
+
+.github/workflows/providers-backport-check.yml
+PROVIDERS-BACKPORT.md
+PROVIDERS-VALIDATION.md
+adapter/experimental.go
+adapter/outbound/manager.go
+adapter/provider.go
+adapter/provider/
+box.go
+cmd/sing-box/cmd.go
+constant/provider.go
+experimental/cachefile/cache.go
+experimental/clashapi/provider.go
+experimental/clashapi/server.go
+experimental/libbox/config.go
+experimental/libbox/service.go
+go.mod
+include/registry.go
+option/group.go
+option/options.go
+option/provider.go
+protocol/group/selector.go
+protocol/group/urltest.go
+provider/
+test/box_test.go

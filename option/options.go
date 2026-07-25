@@ -3,6 +3,7 @@ package option
 import (
 	"bytes"
 	"context"
+	"strconv"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -17,6 +18,7 @@ type _Options struct {
 	Endpoints    []Endpoint           `json:"endpoints,omitempty"`
 	Inbounds     []Inbound            `json:"inbounds,omitempty"`
 	Outbounds    []Outbound           `json:"outbounds,omitempty"`
+	Providers    []Provider           `json:"providers,omitempty"`
 	Route        *RouteOptions        `json:"route,omitempty"`
 	Experimental *ExperimentalOptions `json:"experimental,omitempty"`
 }
@@ -50,6 +52,10 @@ func checkOptions(options *Options) error {
 		return err
 	}
 	err = checkOutbounds(options.Outbounds, options.Endpoints)
+	if err != nil {
+		return err
+	}
+	err = checkProviders(options.Providers)
 	if err != nil {
 		return err
 	}
@@ -89,6 +95,21 @@ func checkOutbounds(outbounds []Outbound, endpoints []Endpoint) error {
 			return E.New("duplicate outbound/endpoint tag: ", endpoint.Tag)
 		}
 		seen[endpoint.Tag] = true
+	}
+	return nil
+}
+
+func checkProviders(providers []Provider) error {
+	seen := make(map[string]bool)
+	for index, provider := range providers {
+		tag := provider.Tag
+		if tag == "" {
+			tag = strconv.Itoa(index)
+		}
+		if seen[tag] {
+			return E.New("duplicate provider tag: ", tag)
+		}
+		seen[tag] = true
 	}
 	return nil
 }
