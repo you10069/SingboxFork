@@ -1,84 +1,92 @@
-# sing-box 1.11.15 → MetaCubeX/uTLS v1.8.4 回移说明
+# sing-box 1.11.15 MetaCubeX/uTLS v1.8.4 backport
 
-本补丁只围绕 uTLS/REALITY/Vision 的类型兼容闭环修改，不回移 sing-box 1.12 的其他新功能。
+This source tree keeps the sing-box 1.11.15 architecture and configuration model,
+while backporting the finalized uTLS/REALITY integration used by the 1.12 line.
+It is a custom build and must not be represented as the official v1.11.15 release.
 
-## 修改文件
+## Final dependency set
+
+- `github.com/metacubex/utls v1.8.4`
+- `github.com/sagernet/sing-vmess v0.2.7`
+- `github.com/sagernet/sing-shadowtls v0.2.1-0.20250503051639-fcd445d33c11`
+- `github.com/sagernet/sing v0.6.11`
+- `github.com/klauspost/compress v1.17.9`
+- `golang.org/x/crypto v0.33.0`
+- `golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e`
+- `golang.org/x/sys v0.30.0`
+
+## Source changes
 
 1. `common/tls/utls_client.go`
-   - `github.com/sagernet/utls` → `github.com/metacubex/utls`
+   - Replaced the archived SagerNet/uTLS import with MetaCubeX/uTLS.
 
 2. `common/tls/reality_client.go`
-   - 切换到 MetaCubeX/uTLS。
-   - 移除 `X25519MLKEM768` 的 SupportedCurves/KeyShare 项后重新构建握手状态。
-   - 适配 `State13.KeyShareKeys.Ecdhe`。
+   - Replaced the uTLS import.
+   - Removes `X25519MLKEM768` from supported curves and key shares before the
+     REALITY authentication key is calculated.
+   - Uses the new `State13.KeyShareKeys.Ecdhe` handshake-state API.
+   - Does **not** expose `SetSessionIDGenerator`; the REALITY session ID carries
+     authentication data and must not be replaced by ShadowTLS.
 
-3. `common/badtls/read_wait_utls.go`
-   - 切换 import 和两条 `go:linkname` 路径。
-   - 同时识别 `*utls.UConn` 与 Reality 服务端使用的 `*utls.Conn`。
-   - 保留 `common.Cast`，以兼容 1.11.15 的 TLS wrapper/Upstream 链。
+3. `common/tls/reality_server.go`
+   - Uses `utls.RealityConfig`, `utls.RealityServer`, and `utls.Conn`.
+   - Uses the final nil-safe Reality logging callback.
 
-4. `common/tls/reality_server.go`
-   - `sagernet/reality` → MetaCubeX/uTLS 内置 `RealityConfig`、`RealityServer`、`Conn`。
-   - 构建条件改为 `with_reality_server && with_utls`。
+4. `common/tls/reality_stub.go`
+   - Keeps the 1.11 build model: the server requires both
+     `with_reality_server` and `with_utls`.
 
-5. `common/tls/reality_stub.go`
-   - 对应调整构建条件，避免只开 `with_reality_server` 时重复定义或缺少实现。
+5. `common/badtls/read_wait_utls.go`
+   - Updates both import and `go:linkname` targets to MetaCubeX/uTLS.
+   - Supports both client `utls.UConn` and server `utls.Conn` through the 1.11
+     wrapper-unwrapping mechanism.
 
-6. `go.mod`
-   - `sagernet/utls v1.6.7` → `metacubex/utls v1.8.4`
-   - `sing-vmess v0.2.3` → `v0.2.4`（Vision 对新 uTLS 类型的最低兼容版本）
-   - `sing v0.6.10` → `v0.6.11`（由 sing-vmess v0.2.4 要求）
-   - 同步 MetaCubeX/uTLS v1.8.4 的 Go 1.20 兼容依赖：`x/crypto v0.33.0`、指定 `x/exp`、`compress v1.17.9`。
-   - 移除独立 `sagernet/reality`。
+6. `common/tls/reality_client_utls_test.go`
+   - Regression test ensuring REALITY cannot implement the generic
+     `WithSessionIDGenerator` interface.
 
-## 必须重新生成校验文件
+7. `go.mod`, `go.sum`, `test/go.mod`, `test/go.sum`
+   - Removes the old `github.com/sagernet/utls` and
+     `github.com/sagernet/reality` dependency paths.
+   - Aligns Vision and ShadowTLS with MetaCubeX/uTLS-compatible releases.
 
-在仓库根目录运行：
+## Build tags
 
-```bash
-go mod tidy
-go mod verify
-```
+This is still a 1.11 source tree. Do not copy the 1.12 tag list unchanged.
 
-测试子模块还保留旧模块的间接记录，应继续运行：
+- REALITY client: `with_utls`
+- REALITY server: `with_utls,with_reality_server`
+- ECH in the 1.11 architecture: `with_ech`
 
-```bash
-cd test
-go mod tidy
-go mod verify
-cd ..
-```
-
-提交根目录和 `test/` 下更新后的 `go.mod`、`go.sum`。
-
-## 编译验证
-
-完整 CLI/服务端：
-
-```bash
-go build -trimpath \
-  -tags "with_utls,with_reality_server" \
-  -o sing-box ./cmd/sing-box
-```
-
-Android/libbox 构建通常只启用 `with_utls`，不编译 Reality 服务端文件；但仓库完整构建仍应保留服务端迁移。
-
-检查最终二进制：
-
-```bash
-go version -m ./sing-box | grep -E "metacubex/utls|sagernet/utls|sagernet/reality|sing-vmess"
-```
-
-预期包含：
+Recommended complete CLI tags:
 
 ```text
-github.com/metacubex/utls v1.8.4
-github.com/sagernet/sing-vmess v0.2.4
+with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_reality_server,with_acme,with_clash_api,with_ech
 ```
 
-不应包含：
+## Recommended build
 
-```text
-github.com/sagernet/utls
-github.com/sagernet/reality
+```bash
+CGO_ENABLED=0 go build \
+  -trimpath \
+  -tags 'with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_reality_server,with_acme,with_clash_api,with_ech' \
+  -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.11.15-utls.1 -s -w -buildid=' \
+  -o sing-box \
+  ./cmd/sing-box
 ```
+
+The included `.github/workflows/utls-backport-check.yml` performs module
+verification, targeted package compilation, the Session ID regression test,
+a complete CLI build, and an embedded dependency audit.
+
+## Deliberately not backported
+
+The following 1.12 features are intentionally excluded because they require
+broader 1.12 architecture and API changes rather than only the uTLS migration:
+
+- TLS fragment and TLS record fragment
+- the 1.12 ECH configuration redesign
+- Tailscale support
+- `ReaderReplaceable` / `WriterReplaceable` network wrapper APIs
+- the 1.12 DNS and domain-resolver redesign
+- removal of the separate `with_reality_server` tag
