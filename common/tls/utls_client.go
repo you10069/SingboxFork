@@ -12,10 +12,10 @@ import (
 	"os"
 	"strings"
 
+	utls "github.com/metacubex/utls"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/ntp"
-	utls "github.com/metacubex/utls"
 
 	"golang.org/x/net/http2"
 )

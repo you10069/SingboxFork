@@ -1,4 +1,4 @@
-//go:build !with_reality_server
+//go:build !with_reality_server || !with_utls
 
 package tls
 
@@ -11,5 +11,5 @@ import (
 )
 
 func NewRealityServer(ctx context.Context, logger log.Logger, options option.InboundTLSOptions) (ServerConfig, error) {
-	return nil, E.New(`reality server is not included in this build, rebuild with -tags with_reality_server`)
+	return nil, E.New(`reality server is not included in this build, rebuild with -tags with_reality_server,with_utls`)
 }

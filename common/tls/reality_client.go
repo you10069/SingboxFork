@@ -27,11 +27,12 @@ import (
 	"time"
 	"unsafe"
 
+	utls "github.com/metacubex/utls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
 	aTLS "github.com/sagernet/sing/common/tls"
-	utls "github.com/sagernet/utls"
 
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
@@ -112,6 +113,26 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		return nil, err
 	}
 
+	// REALITY authentication currently uses the classical X25519 key share.
+	// Newer Chrome templates may advertise X25519MLKEM768 first, so remove it
+	// before rebuilding the handshake state, matching the later sing-box fix.
+	for _, extension := range uConn.Extensions {
+		if supportedCurves, isSupportedCurves := extension.(*utls.SupportedCurvesExtension); isSupportedCurves {
+			supportedCurves.Curves = common.Filter(supportedCurves.Curves, func(curveID utls.CurveID) bool {
+				return curveID != utls.X25519MLKEM768
+			})
+		}
+		if keyShare, isKeyShare := extension.(*utls.KeyShareExtension); isKeyShare {
+			keyShare.KeyShares = common.Filter(keyShare.KeyShares, func(share utls.KeyShare) bool {
+				return share.Group != utls.X25519MLKEM768
+			})
+		}
+	}
+	err = uConn.BuildHandshakeState()
+	if err != nil {
+		return nil, err
+	}
+
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
 			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
@@ -145,9 +166,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
-	ecdheKey := uConn.HandshakeState.State13.EcdheKey
+	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
+	if keyShareKeys == nil {
+		return nil, E.New("nil KeyShareKeys")
+	}
+	ecdheKey := keyShareKeys.Ecdhe
 	if ecdheKey == nil {
-		return nil, E.New("nil ecdhe_key")
+		return nil, E.New("nil ecdheKey")
 	}
 	authKey, err := ecdheKey.ECDH(publicKey)
 	if err != nil {

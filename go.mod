@@ -14,6 +14,7 @@ require (
 	github.com/libdns/cloudflare v0.1.1
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/metacubex/tfo-go v0.0.0-20241231083714-66613d49c422
+	github.com/metacubex/utls v1.8.4
 	github.com/mholt/acmez v1.2.0
 	github.com/miekg/dns v1.1.63
 	github.com/oschwald/maxminddb-golang v1.12.0
@@ -25,8 +26,7 @@ require (
 	github.com/sagernet/gomobile v0.1.4
 	github.com/sagernet/gvisor v0.0.0-20241123041152-536d05261cff
 	github.com/sagernet/quic-go v0.49.0-beta.1
-	github.com/sagernet/reality v0.0.0-20230406110435-ee17307e7691
-	github.com/sagernet/sing v0.6.10
+	github.com/sagernet/sing v0.6.11
 	github.com/sagernet/sing-dns v0.4.6
 	github.com/sagernet/sing-mux v0.3.2
 	github.com/sagernet/sing-quic v0.4.4
@@ -34,17 +34,16 @@ require (
 	github.com/sagernet/sing-shadowsocks2 v0.2.1
 	github.com/sagernet/sing-shadowtls v0.2.0
 	github.com/sagernet/sing-tun v0.6.9
-	github.com/sagernet/sing-vmess v0.2.3
+	github.com/sagernet/sing-vmess v0.2.4
 	github.com/sagernet/smux v1.5.34-mod.2
-	github.com/metacubex/utls v1.8.4
 	github.com/sagernet/wireguard-go v0.0.1-beta.7
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.10.0
 	go.uber.org/zap v1.27.0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.32.0
-	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56
+	golang.org/x/crypto v0.33.0
+	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e
 	golang.org/x/mod v0.20.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.30.0
@@ -74,7 +73,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
-	github.com/klauspost/compress v1.17.4 // indirect
+	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/libdns/libdns v0.2.2 // indirect
 	github.com/mdlayher/netlink v1.7.2 // indirect
