@@ -21,6 +21,7 @@ import (
 
 type Adapter struct {
 	ctx          context.Context
+	cancel       context.CancelFunc
 	outbound     adapter.OutboundManager
 	router       adapter.Router
 	logFactory   log.Factory
@@ -48,6 +49,7 @@ type Adapter struct {
 }
 
 func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions) Adapter {
+	ctx, cancel := context.WithCancel(ctx)
 	timeout := time.Duration(options.Timeout)
 	if timeout == 0 {
 		timeout = 3 * time.Second
@@ -61,6 +63,7 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 	}
 	return Adapter{
 		ctx:          ctx,
+		cancel:       cancel,
 		outbound:     outbound,
 		router:       router,
 		logFactory:   logFactory,
@@ -410,6 +413,7 @@ func (a *Adapter) UpdateGroups() {
 }
 
 func (a *Adapter) Close() error {
+	a.cancel()
 	a.tickerAccess.Lock()
 	if a.ticker != nil {
 		a.ticker.Stop()

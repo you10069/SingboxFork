@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -56,7 +55,7 @@ type ProviderRemote struct {
 	dialer       N.Dialer
 	tickerAccess sync.Mutex
 	ticker       *time.Ticker
-	updating     atomic.Bool
+	fetchAccess  sync.Mutex
 
 	stateAccess      sync.RWMutex
 	lastEtag         string
@@ -206,14 +205,23 @@ func (s *ProviderRemote) Close() error {
 		s.ticker = nil
 	}
 	s.tickerAccess.Unlock()
+
+	// Wait for an in-flight download/parse/update transaction before removing
+	// its dynamic outbounds. Otherwise a nearly completed fetch could recreate
+	// provider nodes after Close has already removed them.
+	s.fetchAccess.Lock()
+	s.fetchAccess.Unlock()
 	return common.Close(&s.Adapter)
 }
 
 func (s *ProviderRemote) fetch(ctx context.Context) error {
-	if s.updating.Swap(true) {
+	if !s.fetchAccess.TryLock() {
 		return E.New("provider is updating")
 	}
-	defer s.updating.Store(false)
+	defer s.fetchAccess.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 
 	requestContext, cancel := context.WithTimeout(ctx, providerRequestTimeout)
 	defer cancel()
