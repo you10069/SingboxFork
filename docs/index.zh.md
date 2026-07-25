@@ -1,14 +1,14 @@
-# sing-box
+---
+description: 欢迎来到该 sing-box 项目的文档页。
+---
 
-The universal proxy platform.
+# :material-home: 开始
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
+欢迎来到该 sing-box 项目的文档页。
 
-## Documentation
+通用代理平台。
 
-https://sing-box.sagernet.org
-
-## License
+## 授权
 
 ```
 Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
