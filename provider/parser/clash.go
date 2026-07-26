@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"strconv"
 	"strings"
+	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -168,7 +169,7 @@ func (t *TuicOption) Build() any {
 		UDPRelayMode:                t.UdpRelayMode,
 		UDPOverStream:               t.UDPOverStream,
 		ZeroRTTHandshake:            t.ReduceRtt,
-		Heartbeat:                   badoption.Duration(t.HeartbeatInterval),
+		Heartbeat:                   badoption.Duration(time.Duration(t.HeartbeatInterval) * time.Millisecond),
 		OutboundTLSOptionsContainer: clashTLSOptions(t.Server, &t.TLSOptions),
 	}
 	if t.Ip != "" {
