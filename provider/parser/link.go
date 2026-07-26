@@ -456,7 +456,7 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 			if value == "1" || value == "true" {
 				TLSOptions.Insecure = true
 			}
-		case "serviceName", "sni", "peer":
+		case "sni", "peer":
 			TLSOptions.ServerName = value
 		case "alpn":
 			TLSOptions.ALPN = strings.Split(value, ",")
