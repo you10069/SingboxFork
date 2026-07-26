@@ -233,8 +233,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 			return s.dialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},
 		TLSClientConfig: &tls.Config{
-			Time:    ntp.TimeFuncFromContext(ctx),
-			RootCAs: adapter.RootPoolFromContext(ctx),
+			Time: ntp.TimeFuncFromContext(ctx),
 		},
 	}
 	defer transport.CloseIdleConnections()
@@ -328,9 +327,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	etag := response.Header.Get("Etag")
 	s.stateAccess.Lock()
 	s.lastEtag = etag
-	if hasInfo {
-		s.subscriptionInfo = info
-	}
+	s.subscriptionInfo = info
 	s.lastUpdated = now
 	lastEtag = s.lastEtag
 	s.stateAccess.Unlock()
