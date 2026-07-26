@@ -185,30 +185,20 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (s *Selector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	selected := s.selected.Load()
-	if selected == nil {
+	if s.selected.Load() == nil {
 		N.CloseOnHandshakeFailure(conn, onClose, E.New("selector has no available outbound"))
 		return
 	}
-	if outboundHandler, isHandler := selected.(adapter.ConnectionHandlerEx); isHandler {
-		outboundHandler.NewConnectionEx(ctx, conn, metadata, onClose)
-	} else {
-		s.connection.NewConnection(ctx, selected, conn, metadata, onClose)
-	}
+	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
 }
 
 func (s *Selector) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	selected := s.selected.Load()
-	if selected == nil {
+	if s.selected.Load() == nil {
 		N.CloseOnHandshakeFailure(conn, onClose, E.New("selector has no available outbound"))
 		return
 	}
-	if outboundHandler, isHandler := selected.(adapter.PacketConnectionHandlerEx); isHandler {
-		outboundHandler.NewPacketConnectionEx(ctx, conn, metadata, onClose)
-	} else {
-		s.connection.NewPacketConnection(ctx, selected, conn, metadata, onClose)
-	}
+	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 
 func RealTag(detour adapter.Outbound) string {
