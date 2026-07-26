@@ -365,6 +365,20 @@ func parseVMessLink(link string) (option.Outbound, error) {
 			}
 		}
 	}
+	// Apply explicit TLS fields after iterating proxy because Go map iteration
+	// order is random, and "add" must not overwrite an explicitly configured SNI.
+	if serverName := strings.TrimSpace(proxy["sni"]); serverName != "" {
+		TLSOptions.ServerName = serverName
+	}
+	if alpnValue := strings.TrimSpace(proxy["alpn"]); alpnValue != "" {
+		TLSOptions.ALPN = nil
+		for _, protocol := range strings.Split(alpnValue, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if protocol != "" {
+				TLSOptions.ALPN = append(TLSOptions.ALPN, protocol)
+			}
+		}
+	}
 	if TLSOptions.Enabled {
 		options.TLS = &TLSOptions
 	}
