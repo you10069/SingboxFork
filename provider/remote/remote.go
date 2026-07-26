@@ -234,8 +234,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 			return s.dialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},
 		TLSClientConfig: &tls.Config{
-			Time:    ntp.TimeFuncFromContext(ctx),
-			RootCAs: adapter.RootPoolFromContext(ctx),
+			Time: ntp.TimeFuncFromContext(ctx),
 		},
 	}
 	defer transport.CloseIdleConnections()
