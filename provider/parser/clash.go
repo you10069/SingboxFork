@@ -204,7 +204,7 @@ type VmessOption struct {
 }
 
 func (v *VmessOption) Build() any {
-	if v.TLSOptions != nil {
+	if v.TLSOptions != nil && v.SNI == "" && v.ServerName != "" {
 		v.SNI = v.ServerName
 	}
 	switch v.PacketEncoding {
@@ -253,7 +253,7 @@ type VlessOption struct {
 }
 
 func (v *VlessOption) Build() any {
-	if v.TLSOptions != nil {
+	if v.TLSOptions != nil && v.SNI == "" && v.ServerName != "" {
 		v.SNI = v.ServerName
 	}
 	switch v.PacketEncoding {
