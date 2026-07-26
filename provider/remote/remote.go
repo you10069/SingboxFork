@@ -1,7 +1,6 @@
 package remote
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -234,7 +233,8 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 			return s.dialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},
 		TLSClientConfig: &tls.Config{
-			Time: ntp.TimeFuncFromContext(ctx),
+			Time:    ntp.TimeFuncFromContext(ctx),
+			RootCAs: adapter.RootPoolFromContext(ctx),
 		},
 	}
 	defer transport.CloseIdleConnections()
@@ -292,12 +292,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 			savedSubscription := s.cacheFile.LoadSubscription(s.cacheKey)
 			if savedSubscription != nil {
 				if hasInfo {
-					separator := bytes.IndexByte(savedSubscription.Content, '\n')
-					if separator >= 0 {
-						savedSubscription.Content = append([]byte(infoString+"\n"), savedSubscription.Content[separator+1:]...)
-					} else {
-						savedSubscription.Content = append([]byte(infoString+"\n"), savedSubscription.Content...)
-					}
+					savedSubscription.Content = updateCachedSubscriptionInfo(savedSubscription.Content, infoString)
 				}
 				savedSubscription.LastUpdated = now
 				if err := s.cacheFile.SaveSubscription(s.cacheKey, savedSubscription); err != nil {
@@ -431,6 +426,14 @@ func getFirstLine(content string) (string, string) {
 		return lines[0], ""
 	}
 	return lines[0], lines[1]
+}
+
+func updateCachedSubscriptionInfo(content []byte, infoString string) []byte {
+	firstLine, remaining := getFirstLine(string(content))
+	if _, hasInfo := parseInfo(firstLine); hasInfo {
+		return []byte(infoString + "\n" + remaining)
+	}
+	return append([]byte(infoString+"\n"), content...)
 }
 
 func parseInfo(infoString string) (adapter.SubscriptionInfo, bool) {
