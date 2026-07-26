@@ -268,7 +268,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			}
 		}
 	}
+	replaceDefault := false
 	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
+		replaceDefault = m.defaultOutbound == existsOutbound
 		if m.started {
 			err = common.Close(existsOutbound)
 			if err != nil {
@@ -293,7 +295,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
 		}
 	}
-	if tag == m.defaultTag || (m.defaultTag == "" && m.defaultOutbound == nil) {
+	if replaceDefault || tag == m.defaultTag || (m.defaultTag == "" && m.defaultOutbound == nil) {
 		m.defaultOutbound = outbound
 		if m.started {
 			m.logger.Info("updated default outbound to ", outbound.Tag())
