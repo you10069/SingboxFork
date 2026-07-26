@@ -404,7 +404,7 @@ func (h *Hysteria2Option) Build() any {
 		DialerOptions:               h.DialerOptions.Build(),
 		ServerOptions:               h.ServerOptions.Build(),
 		ServerPorts:                 clashPorts(h.Ports),
-		HopInterval:                 badoption.Duration(h.HopInterval),
+		HopInterval:                 badoption.Duration(time.Duration(h.HopInterval) * time.Second),
 		UpMbps:                      clashSpeedToIntMbps(h.Up),
 		DownMbps:                    clashSpeedToIntMbps(h.Down),
 		Obfs:                        clashHysteria2Obfs(h.Obfs, h.ObfsPassword),

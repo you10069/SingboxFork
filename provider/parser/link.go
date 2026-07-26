@@ -518,7 +518,7 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 			if value == "1" || value == "true" {
 				TLSOptions.Insecure = true
 			}
-		case "serviceName", "sni", "peer":
+		case "sni", "peer":
 			TLSOptions.ServerName = value
 		case "alpn":
 			TLSOptions.ALPN = strings.Split(value, ",")
@@ -543,9 +543,11 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"])
 			case "grpc":
 				Transport.Type = C.V2RayTransportTypeGRPC
-				if serviceName, exists := proxy["grpc-service-name"]; exists && serviceName != "" {
-					Transport.GRPCOptions.ServiceName = serviceName
+				serviceName := proxy["serviceName"]
+				if serviceName == "" {
+					serviceName = proxy["grpc-service-name"]
 				}
+				Transport.GRPCOptions.ServiceName = serviceName
 			default:
 				continue
 			}
@@ -660,6 +662,10 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 			}
 		case "obfs-password":
 			Obfs.Password = value
+		case "sni", "peer":
+			if value != "" {
+				TLSOptions.ServerName = value
+			}
 		case "insecure", "skip-cert-verify":
 			if value == "1" || value == "true" {
 				TLSOptions.Insecure = true
