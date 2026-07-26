@@ -6,7 +6,7 @@ on:
     paths:
       - "adapter/provider.go"
       - "adapter/provider/**"
-      - "adapter/outbound/manager.go"
+      - "adapter/outbound/**"
       - "box.go"
       - "constant/provider.go"
       - "experimental/cachefile/**"
@@ -24,7 +24,7 @@ on:
     paths:
       - "adapter/provider.go"
       - "adapter/provider/**"
-      - "adapter/outbound/manager.go"
+      - "adapter/outbound/**"
       - "box.go"
       - "constant/provider.go"
       - "experimental/cachefile/**"
@@ -65,9 +65,22 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
-      - name: Run Provider option, parser and adapter tests
+      - name: Run Provider transaction, option, parser and group tests
         run: |
-          go test ./option ./provider/parser ./adapter/provider
+          go test \
+            ./adapter/outbound \
+            ./adapter/provider \
+            ./option \
+            ./provider/parser \
+            ./provider/remote \
+            ./protocol/group
+
+      - name: Run focused race tests
+        run: |
+          go test -race \
+            ./adapter/outbound \
+            ./adapter/provider \
+            ./protocol/group
 
       - name: Compile Provider integration packages
         run: |
@@ -83,7 +96,7 @@ jobs:
           CGO_ENABLED=0 go build \
             -trimpath \
             -tags 'with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_reality_server,with_acme,with_clash_api,with_ech' \
-            -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.11.15-utls-providers.2 -s -w -buildid=' \
+            -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.11.15-utls-providers.5 -s -w -buildid=' \
             -o sing-box \
             ./cmd/sing-box
 
@@ -109,7 +122,13 @@ jobs:
               {
                 "type": "selector",
                 "tag": "select",
-                "providers": ["demo"]
+                "providers": ["demo"],
+                "include_all_outbounds": true,
+                "include": "node|direct",
+                "exclude": "expire",
+                "exclude_all": false,
+                "exclude_type": "tuic",
+                "exclude_type_all": false
               }
             ],
             "route": {
@@ -118,3 +137,25 @@ jobs:
           }
           JSON
           ./sing-box check -c provider-check.json
+
+      - name: Verify configuration without Providers
+        run: |
+          cat > no-provider-check.json <<'JSON'
+          {
+            "outbounds": [
+              {
+                "type": "direct",
+                "tag": "direct"
+              },
+              {
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["direct"]
+              }
+            ],
+            "route": {
+              "final": "select"
+            }
+          }
+          JSON
+          ./sing-box check -c no-provider-check.json

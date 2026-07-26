@@ -1,0 +1,260 @@
+package group
+
+import (
+	"context"
+	"errors"
+	"net"
+	"regexp"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/log"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/x/list"
+	"github.com/stretchr/testify/require"
+)
+
+type candidateTestOutbound struct {
+	tag      string
+	typeName string
+}
+
+func (o *candidateTestOutbound) Type() string           { return o.typeName }
+func (o *candidateTestOutbound) Tag() string            { return o.tag }
+func (o *candidateTestOutbound) Network() []string      { return []string{"tcp", "udp"} }
+func (o *candidateTestOutbound) Dependencies() []string { return nil }
+func (o *candidateTestOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return nil, errors.New("not implemented")
+}
+func (o *candidateTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+type candidateTestManager struct {
+	outbounds []adapter.Outbound
+	byTag     map[string]adapter.Outbound
+}
+
+func newCandidateTestManager(outbounds ...adapter.Outbound) *candidateTestManager {
+	byTag := make(map[string]adapter.Outbound, len(outbounds))
+	for _, outbound := range outbounds {
+		byTag[outbound.Tag()] = outbound
+	}
+	return &candidateTestManager{outbounds: outbounds, byTag: byTag}
+}
+func (*candidateTestManager) Start(adapter.StartStage) error { return nil }
+func (*candidateTestManager) Close() error                   { return nil }
+func (m *candidateTestManager) Outbounds() []adapter.Outbound {
+	return append([]adapter.Outbound(nil), m.outbounds...)
+}
+func (m *candidateTestManager) Outbound(tag string) (adapter.Outbound, bool) {
+	outbound, ok := m.byTag[tag]
+	return outbound, ok
+}
+func (m *candidateTestManager) Default() adapter.Outbound {
+	if len(m.outbounds) == 0 {
+		return nil
+	}
+	return m.outbounds[0]
+}
+func (*candidateTestManager) Remove(string) error { return errors.New("not implemented") }
+func (*candidateTestManager) Create(context.Context, adapter.Router, log.ContextLogger, string, string, any) error {
+	return errors.New("not implemented")
+}
+
+type selectorTestConnectionManager struct {
+	connectionDialer       N.Dialer
+	packetConnectionDialer N.Dialer
+	connectionExternal     bool
+	packetExternal         bool
+}
+
+func (*selectorTestConnectionManager) Start(adapter.StartStage) error { return nil }
+func (*selectorTestConnectionManager) Close() error                   { return nil }
+func (m *selectorTestConnectionManager) NewConnection(ctx context.Context, dialer N.Dialer, _ net.Conn, _ adapter.InboundContext, _ N.CloseHandlerFunc) {
+	m.connectionDialer = dialer
+	m.connectionExternal = interrupt.IsExternalConnectionFromContext(ctx)
+}
+func (m *selectorTestConnectionManager) NewPacketConnection(ctx context.Context, dialer N.Dialer, _ N.PacketConn, _ adapter.InboundContext, _ N.CloseHandlerFunc) {
+	m.packetConnectionDialer = dialer
+	m.packetExternal = interrupt.IsExternalConnectionFromContext(ctx)
+}
+
+type candidateTestProvider struct {
+	tag       string
+	outbounds []adapter.Outbound
+}
+
+func (*candidateTestProvider) Type() string  { return "test" }
+func (p *candidateTestProvider) Tag() string { return p.tag }
+func (p *candidateTestProvider) Outbounds() []adapter.Outbound {
+	return append([]adapter.Outbound(nil), p.outbounds...)
+}
+func (p *candidateTestProvider) Outbound(tag string) (adapter.Outbound, bool) {
+	for _, outbound := range p.outbounds {
+		if outbound.Tag() == tag {
+			return outbound, true
+		}
+	}
+	return nil, false
+}
+func (*candidateTestProvider) UpdatedAt() time.Time { return time.Time{} }
+func (*candidateTestProvider) HealthCheck(context.Context) (map[string]uint16, error) {
+	return nil, nil
+}
+func (*candidateTestProvider) RegisterCallback(adapter.ProviderUpdateCallback) *list.Element[adapter.ProviderUpdateCallback] {
+	return nil
+}
+func (*candidateTestProvider) UnregisterCallback(*list.Element[adapter.ProviderUpdateCallback]) {}
+
+func TestCollectGroupOutboundsFilterScopes(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	explicitBlocked := &candidateTestOutbound{tag: "explicit-blocked", typeName: "vless"}
+	autoHK := &candidateTestOutbound{tag: "auto-hk", typeName: "vless"}
+	autoJP := &candidateTestOutbound{tag: "auto-jp", typeName: "trojan"}
+	providerHK := &candidateTestOutbound{tag: "provider/hk", typeName: "vless"}
+	providerExpire := &candidateTestOutbound{tag: "provider/expire", typeName: "vless"}
+	manager := newCandidateTestManager(direct, explicitBlocked, autoHK, autoJP)
+	provider := &candidateTestProvider{tag: "provider", outbounds: []adapter.Outbound{providerHK, providerExpire}}
+
+	outbounds, tags, err := collectGroupOutbounds(
+		manager,
+		"selector",
+		[]string{"direct", "explicit-blocked"},
+		[]string{"auto-hk", "auto-jp"},
+		[]string{"provider"},
+		map[string]adapter.Provider{"provider": provider},
+		nil,
+		groupFilterOptions{
+			include:     regexp.MustCompile("hk"),
+			exclude:     regexp.MustCompile("blocked|expire"),
+			excludeType: regexp.MustCompile("trojan"),
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"direct", "explicit-blocked", "auto-hk", "provider/hk"}, tags)
+	require.Len(t, outbounds, 4)
+}
+
+func TestCollectGroupOutboundsExcludeAll(t *testing.T) {
+	explicit := &candidateTestOutbound{tag: "explicit-blocked", typeName: "vless"}
+	explicitTrojan := &candidateTestOutbound{tag: "manual-trojan", typeName: "trojan"}
+	manager := newCandidateTestManager(explicit, explicitTrojan)
+
+	_, tags, err := collectGroupOutbounds(
+		manager,
+		"selector",
+		[]string{"explicit-blocked", "manual-trojan"},
+		nil,
+		nil,
+		nil,
+		nil,
+		groupFilterOptions{
+			exclude:        regexp.MustCompile("blocked"),
+			excludeType:    regexp.MustCompile("trojan"),
+			excludeAll:     true,
+			excludeTypeAll: true,
+		},
+	)
+	require.NoError(t, err)
+	require.Empty(t, tags)
+}
+
+func TestCollectGroupOutboundsExplicitWinsDeduplication(t *testing.T) {
+	node := &candidateTestOutbound{tag: "node", typeName: "vless"}
+	manager := newCandidateTestManager(node)
+	_, tags, err := collectGroupOutbounds(
+		manager,
+		"selector",
+		[]string{"node"},
+		[]string{"node"},
+		nil,
+		nil,
+		nil,
+		groupFilterOptions{include: regexp.MustCompile("does-not-match")},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"node"}, tags)
+}
+
+func TestCollectGroupOutboundsUsesProviderOverride(t *testing.T) {
+	oldNode := &candidateTestOutbound{tag: "provider/old", typeName: "vless"}
+	newNode := &candidateTestOutbound{tag: "provider/new", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider", outbounds: []adapter.Outbound{oldNode}}
+	_, tags, err := collectGroupOutbounds(
+		newCandidateTestManager(),
+		"selector",
+		nil,
+		nil,
+		[]string{"provider"},
+		map[string]adapter.Provider{"provider": provider},
+		map[string][]adapter.Outbound{"provider": {newNode}},
+		groupFilterOptions{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"provider/new"}, tags)
+}
+
+func TestSelectorProviderPreparationRebindsObjectByTag(t *testing.T) {
+	oldNode := &candidateTestOutbound{tag: "provider/node", typeName: "vless"}
+	newNode := &candidateTestOutbound{tag: "provider/node", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider", outbounds: []adapter.Outbound{oldNode}}
+	selector := &Selector{
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(),
+		providerTags:   []string{"provider"},
+		providers:      map[string]adapter.Provider{"provider": provider},
+		tags:           []string{"provider/node"},
+		outbounds:      map[string]adapter.Outbound{"provider/node": oldNode},
+		interruptGroup: interrupt.NewGroup(),
+	}
+	selector.selected.Swap(oldNode)
+
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{newNode})
+	require.NoError(t, err)
+	require.Same(t, oldNode, selector.selected.Load())
+	preparation.Commit()
+	require.Same(t, newNode, selector.selected.Load())
+	require.Equal(t, []string{"provider/node"}, selector.All())
+}
+
+func TestSelectorProviderPreparationRejectsRuntimeEmptyGroup(t *testing.T) {
+	oldNode := &candidateTestOutbound{tag: "provider/node", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider", outbounds: []adapter.Outbound{oldNode}}
+	selector := &Selector{
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(),
+		providerTags:   []string{"provider"},
+		providers:      map[string]adapter.Provider{"provider": provider},
+		tags:           []string{"provider/node"},
+		outbounds:      map[string]adapter.Outbound{"provider/node": oldNode},
+		interruptGroup: interrupt.NewGroup(),
+	}
+	selector.selected.Swap(oldNode)
+
+	preparation, err := selector.prepareProviderUpdated("provider", nil)
+	require.Error(t, err)
+	require.Nil(t, preparation)
+	require.Same(t, oldNode, selector.selected.Load())
+}
+
+func TestSelectorConnectionHandlersKeepInterruptWrapper(t *testing.T) {
+	node := &candidateTestOutbound{tag: "node", typeName: "vless"}
+	connectionManager := new(selectorTestConnectionManager)
+	selector := &Selector{
+		connection:     connectionManager,
+		interruptGroup: interrupt.NewGroup(),
+	}
+	selector.selected.Swap(node)
+
+	selector.NewConnectionEx(context.Background(), nil, adapter.InboundContext{}, nil)
+	selector.NewPacketConnectionEx(context.Background(), nil, adapter.InboundContext{}, nil)
+
+	require.Same(t, selector, connectionManager.connectionDialer)
+	require.Same(t, selector, connectionManager.packetConnectionDialer)
+	require.True(t, connectionManager.connectionExternal)
+	require.True(t, connectionManager.packetExternal)
+}

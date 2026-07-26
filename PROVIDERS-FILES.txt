@@ -1,10 +1,12 @@
 # Files changed or added for the Providers backport
-
 .github/workflows/providers-backport-check.yml
 PROVIDERS-BACKPORT.md
+PROVIDERS-TRANSACTIONAL-UPDATE.md
 PROVIDERS-VALIDATION.md
 adapter/experimental.go
+adapter/outbound.go
 adapter/outbound/manager.go
+adapter/outbound/transaction.go
 adapter/provider.go
 adapter/provider/
 box.go
@@ -20,6 +22,7 @@ include/registry.go
 option/group.go
 option/options.go
 option/provider.go
+protocol/group/candidate.go
 protocol/group/selector.go
 protocol/group/urltest.go
 provider/

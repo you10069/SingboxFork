@@ -32,8 +32,10 @@ var (
 )
 
 type providerCallback struct {
-	provider adapter.Provider
-	element  *list.Element[adapter.ProviderUpdateCallback]
+	provider       adapter.Provider
+	element        *list.Element[adapter.ProviderUpdateCallback]
+	preparer       adapter.ProviderUpdatePreparer
+	prepareElement *list.Element[adapter.ProviderUpdatePrepareCallback]
 }
 
 type Selector struct {
@@ -44,11 +46,17 @@ type Selector struct {
 	connection                   adapter.ConnectionManager
 	logger                       logger.ContextLogger
 	staticTags                   []string
+	automaticStaticTags          []string
 	providerTags                 []string
 	defaultTag                   string
 	exclude                      *regexp.Regexp
 	include                      *regexp.Regexp
+	excludeType                  *regexp.Regexp
 	useAllProviders              bool
+	includeAllOutbounds          bool
+	excludeAll                   bool
+	excludeTypeAll               bool
+	rebuildAccess                sync.Mutex
 	access                       sync.RWMutex
 	tags                         []string
 	outbounds                    map[string]adapter.Outbound
@@ -60,6 +68,13 @@ type Selector struct {
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
+	includeAllOutbounds := options.IncludeAll || options.IncludeAllOutbounds
+	useAllProviders := options.IncludeAll || options.UseAllProviders
+	var automaticStaticTags []string
+	if includeAllOutbounds {
+		metadata := service.FromContext[adapter.StaticOutboundMetadata](ctx)
+		automaticStaticTags = append([]string(nil), metadata.Tags...)
+	}
 	result := &Selector{
 		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, nil, options.Outbounds),
 		ctx:                          ctx,
@@ -68,17 +83,22 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		staticTags:                   append([]string(nil), options.Outbounds...),
+		automaticStaticTags:          automaticStaticTags,
 		providerTags:                 append([]string(nil), options.Providers...),
 		defaultTag:                   options.Default,
 		exclude:                      (*regexp.Regexp)(options.Exclude),
 		include:                      (*regexp.Regexp)(options.Include),
-		useAllProviders:              options.UseAllProviders,
+		excludeType:                  (*regexp.Regexp)(options.ExcludeType),
+		useAllProviders:              useAllProviders,
+		includeAllOutbounds:          includeAllOutbounds,
+		excludeAll:                   options.ExcludeAll,
+		excludeTypeAll:               options.ExcludeTypeAll,
 		outbounds:                    make(map[string]adapter.Outbound),
 		providers:                    make(map[string]adapter.Provider),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
-	if len(result.staticTags) == 0 && len(result.providerTags) == 0 && !result.useAllProviders {
+	if len(result.staticTags) == 0 && len(result.providerTags) == 0 && !result.useAllProviders && !result.includeAllOutbounds {
 		return nil, E.New("missing outbound and provider tags")
 	}
 	return result, nil
@@ -101,7 +121,14 @@ func (s *Selector) Start() error {
 		for _, provider := range s.provider.Providers() {
 			s.providerTags = append(s.providerTags, provider.Tag())
 			s.providers[provider.Tag()] = provider
-			s.callbacks = append(s.callbacks, providerCallback{provider, provider.RegisterCallback(s.onProviderUpdated)})
+			callback := providerCallback{provider: provider}
+			if preparer, loaded := provider.(adapter.ProviderUpdatePreparer); loaded {
+				callback.preparer = preparer
+				callback.prepareElement = preparer.RegisterPrepareCallback(s.prepareProviderUpdated)
+			} else {
+				callback.element = provider.RegisterCallback(s.onProviderUpdated)
+			}
+			s.callbacks = append(s.callbacks, callback)
 		}
 	} else {
 		for index, tag := range s.providerTags {
@@ -110,15 +137,26 @@ func (s *Selector) Start() error {
 				return E.New("outbound provider ", index, " not found: ", tag)
 			}
 			s.providers[tag] = provider
-			s.callbacks = append(s.callbacks, providerCallback{provider, provider.RegisterCallback(s.onProviderUpdated)})
+			callback := providerCallback{provider: provider}
+			if preparer, loaded := provider.(adapter.ProviderUpdatePreparer); loaded {
+				callback.preparer = preparer
+				callback.prepareElement = preparer.RegisterPrepareCallback(s.prepareProviderUpdated)
+			} else {
+				callback.element = provider.RegisterCallback(s.onProviderUpdated)
+			}
+			s.callbacks = append(s.callbacks, callback)
 		}
 	}
-	return s.rebuild("")
+	return s.rebuild(nil)
 }
 
 func (s *Selector) Close() error {
 	for _, callback := range s.callbacks {
-		callback.provider.UnregisterCallback(callback.element)
+		if callback.prepareElement != nil {
+			callback.preparer.UnregisterPrepareCallback(callback.prepareElement)
+		} else {
+			callback.provider.UnregisterCallback(callback.element)
+		}
 	}
 	s.callbacks = nil
 	return nil
@@ -139,6 +177,8 @@ func (s *Selector) All() []string {
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {
+	s.rebuildAccess.Lock()
+	defer s.rebuildAccess.Unlock()
 	s.access.RLock()
 	detour, loaded := s.outbounds[tag]
 	s.access.RUnlock()
@@ -212,36 +252,93 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	if _, loaded := s.providers[tag]; !loaded {
 		return E.New("outbound provider not found: ", tag)
 	}
-	return s.rebuild(tag)
+	return s.rebuild(nil)
 }
 
-func (s *Selector) rebuild(_ string) error {
-	tags := make([]string, 0)
-	outbounds := make(map[string]adapter.Outbound)
-	for index, tag := range s.staticTags {
-		detour, loaded := s.outbound.Outbound(tag)
-		if !loaded {
-			return E.New("outbound ", index, " not found: ", tag)
-		}
-		tags = append(tags, tag)
-		outbounds[tag] = detour
+type selectorState struct {
+	tags        []string
+	outbounds   map[string]adapter.Outbound
+	selected    adapter.Outbound
+	oldSelected adapter.Outbound
+}
+
+type selectorProviderUpdatePreparation struct {
+	selector *Selector
+	state    selectorState
+	finished bool
+}
+
+func (p *selectorProviderUpdatePreparation) Commit() {
+	if p == nil || p.finished {
+		return
 	}
-	for _, providerTag := range s.providerTags {
-		provider := s.providers[providerTag]
-		if provider == nil {
-			continue
-		}
-		for _, detour := range provider.Outbounds() {
-			tag := detour.Tag()
-			if s.exclude != nil && s.exclude.MatchString(tag) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(tag) {
-				continue
-			}
-			tags = append(tags, tag)
-			outbounds[tag] = detour
-		}
+	p.finished = true
+	p.selector.applyState(p.state)
+	p.selector.rebuildAccess.Unlock()
+}
+
+func (p *selectorProviderUpdatePreparation) Abort() {
+	if p == nil || p.finished {
+		return
+	}
+	p.finished = true
+	p.selector.rebuildAccess.Unlock()
+}
+
+func (s *Selector) prepareProviderUpdated(tag string, outbounds []adapter.Outbound) (adapter.ProviderUpdatePreparation, error) {
+	if _, loaded := s.providers[tag]; !loaded {
+		return nil, E.New("outbound provider not found: ", tag)
+	}
+	s.rebuildAccess.Lock()
+	state, err := s.buildState(map[string][]adapter.Outbound{tag: outbounds})
+	if err != nil {
+		s.rebuildAccess.Unlock()
+		return nil, err
+	}
+	s.access.RLock()
+	wasAvailable := len(s.tags) > 0
+	s.access.RUnlock()
+	if wasAvailable && len(state.tags) == 0 {
+		s.rebuildAccess.Unlock()
+		return nil, E.New("provider update would leave selector[", s.Tag(), "] without an available outbound")
+	}
+	return &selectorProviderUpdatePreparation{selector: s, state: state}, nil
+}
+
+func (s *Selector) rebuild(providerOverrides map[string][]adapter.Outbound) error {
+	s.rebuildAccess.Lock()
+	defer s.rebuildAccess.Unlock()
+	state, err := s.buildState(providerOverrides)
+	if err != nil {
+		return err
+	}
+	s.applyState(state)
+	return nil
+}
+
+func (s *Selector) buildState(providerOverrides map[string][]adapter.Outbound) (selectorState, error) {
+	collected, tags, err := collectGroupOutbounds(
+		s.outbound,
+		s.Tag(),
+		s.staticTags,
+		s.automaticStaticTags,
+		s.providerTags,
+		s.providers,
+		providerOverrides,
+		groupFilterOptions{
+			include:        s.include,
+			exclude:        s.exclude,
+			excludeType:    s.excludeType,
+			excludeAll:     s.excludeAll,
+			excludeTypeAll: s.excludeTypeAll,
+		},
+	)
+	if err != nil {
+		return selectorState{}, err
+	}
+	outbounds := make(map[string]adapter.Outbound, len(collected))
+	for index, tag := range tags {
+		outbounds[tag] = collected[index]
 	}
 
 	oldSelected := s.selected.Load()
@@ -260,13 +357,15 @@ func (s *Selector) rebuild(_ string) error {
 	if selected == nil && len(tags) > 0 {
 		selected = outbounds[tags[0]]
 	}
+	return selectorState{tags: tags, outbounds: outbounds, selected: selected, oldSelected: oldSelected}, nil
+}
 
+func (s *Selector) applyState(state selectorState) {
 	s.access.Lock()
-	s.tags = tags
-	s.outbounds = outbounds
+	s.tags = state.tags
+	s.outbounds = state.outbounds
 	s.access.Unlock()
-	if s.selected.Swap(selected) != selected && oldSelected != nil {
+	if s.selected.Swap(state.selected) != state.selected && state.oldSelected != nil {
 		s.interruptGroup.Interrupt(s.interruptExternalConnections)
 	}
-	return nil
 }

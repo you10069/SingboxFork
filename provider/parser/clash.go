@@ -41,6 +41,9 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	if err != nil {
 		return err
 	}
+	if c.Type == "" {
+		return E.New("missing clash proxy type")
+	}
 	var options Proxy
 	switch c.Type {
 	case "ss":
@@ -95,19 +98,36 @@ func (c *ClashProxy) Build() option.Outbound {
 	return outbound
 }
 
-func ParseClashSubscription(_ context.Context, content string) ([]option.Outbound, error) {
+func ParseClashSubscriptionDetailed(_ context.Context, content string) (SubscriptionResult, error) {
 	config := &ClashConfig{}
 	err := yaml.Unmarshal([]byte(content), &config)
 	if err != nil {
-		return nil, E.Cause(err, "parse clash config")
+		return SubscriptionResult{}, E.Cause(err, "parse clash config")
 	}
-	outbounds := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Outbound, bool) {
+	result := SubscriptionResult{}
+	for _, proxy := range config.Proxies {
 		if proxy.SingType == "" {
-			return option.Outbound{}, false
+			result.Skipped = append(result.Skipped, SkippedOutbound{
+				Tag:    proxy.Name,
+				Type:   proxy.Type,
+				Reason: "unsupported by current clash subscription parser",
+			})
+			continue
 		}
-		return proxy.Build(), true
-	})
-	return outbounds, nil
+		result.Outbounds = append(result.Outbounds, proxy.Build())
+	}
+	if len(result.Outbounds) == 0 {
+		if len(result.Skipped) > 0 {
+			return result, E.New("provider contains no supported outbounds")
+		}
+		return result, E.New("no servers found")
+	}
+	return result, nil
+}
+
+func ParseClashSubscription(ctx context.Context, content string) ([]option.Outbound, error) {
+	result, err := ParseClashSubscriptionDetailed(ctx, content)
+	return result.Outbounds, err
 }
 
 type ShadowSocksOption struct {

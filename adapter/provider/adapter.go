@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	providerParser "github.com/sagernet/sing-box/provider/parser"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -19,15 +21,19 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+var _ adapter.ProviderUpdatePreparer = (*Adapter)(nil)
+
 type Adapter struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	outbound     adapter.OutboundManager
-	router       adapter.Router
-	logFactory   log.Factory
-	logger       log.ContextLogger
-	providerType string
-	providerTag  string
+	ctx              context.Context
+	cancel           context.CancelFunc
+	outbound         adapter.OutboundManager
+	router           adapter.Router
+	logFactory       log.Factory
+	logger           log.ContextLogger
+	providerType     string
+	providerTag      string
+	additionalPrefix string
+	additionalSuffix string
 
 	updateAccess    sync.Mutex
 	outboundsAccess sync.RWMutex
@@ -39,8 +45,10 @@ type Adapter struct {
 	checking     atomic.Bool
 	history      *urltest.HistoryStorage
 
-	callbackAccess sync.Mutex
-	callbacks      list.List[adapter.ProviderUpdateCallback]
+	callbackAccess        sync.Mutex
+	callbacks             list.List[adapter.ProviderUpdateCallback]
+	prepareCallbackAccess sync.Mutex
+	prepareCallbacks      list.List[adapter.ProviderUpdatePrepareCallback]
 
 	link     string
 	enabled  bool
@@ -48,7 +56,7 @@ type Adapter struct {
 	interval time.Duration
 }
 
-func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions) Adapter {
+func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions, additionalPrefix string, additionalSuffix string) Adapter {
 	ctx, cancel := context.WithCancel(ctx)
 	timeout := time.Duration(options.Timeout)
 	if timeout == 0 {
@@ -62,18 +70,20 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 		interval = time.Minute
 	}
 	return Adapter{
-		ctx:          ctx,
-		cancel:       cancel,
-		outbound:     outbound,
-		router:       router,
-		logFactory:   logFactory,
-		logger:       logger,
-		providerType: providerType,
-		providerTag:  providerTag,
-		enabled:      options.Enabled,
-		link:         options.URL,
-		timeout:      timeout,
-		interval:     interval,
+		ctx:              ctx,
+		cancel:           cancel,
+		outbound:         outbound,
+		router:           router,
+		logFactory:       logFactory,
+		logger:           logger,
+		providerType:     providerType,
+		providerTag:      providerTag,
+		additionalPrefix: additionalPrefix,
+		additionalSuffix: additionalSuffix,
+		enabled:          options.Enabled,
+		link:             options.URL,
+		timeout:          timeout,
+		interval:         interval,
 	}
 }
 
@@ -108,48 +118,60 @@ func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
 	return detour, ok
 }
 
-func providerOutboundTag(providerTag string, optionTag string, index int) string {
-	if optionTag != "" {
-		return F.ToString(providerTag, "/", optionTag)
-	}
-	return F.ToString(providerTag, "/", index)
+func (a *Adapter) NormalizeProviderTags(outbounds []option.Outbound) {
+	providerParser.NormalizeProviderTags(outbounds, a.additionalPrefix, a.additionalSuffix)
 }
 
-func (a *Adapter) UpdateOutbounds(oldOptions []option.Outbound, newOptions []option.Outbound) ([]option.Outbound, error) {
-	a.updateAccess.Lock()
-	defer a.updateAccess.Unlock()
-
-	// Keep provider state and cache options in their canonical, unprefixed form.
-	// Only the options passed to the outbound manager are cloned and rewritten,
-	// so a cached provider cannot acquire the provider prefix more than once.
-	preparedOptions := cloneProviderOutbounds(newOptions)
-	providerParser.PrefixProviderDetours(a.providerTag, preparedOptions)
-
-	oldOptionByTag := make(map[string]option.Outbound, len(oldOptions))
-	for index, outboundOptions := range oldOptions {
-		oldOptionByTag[providerOutboundTag(a.providerTag, outboundOptions.Tag, index)] = outboundOptions
+func (a *Adapter) providerOutboundTag(optionTag string, index int) string {
+	if a.additionalPrefix != "" {
+		if optionTag != "" {
+			return optionTag
+		}
+		return F.ToString(a.additionalPrefix, index, a.additionalSuffix)
 	}
-	newOptionByTag := make(map[string]option.Outbound, len(newOptions))
-	newIndexByTag := make(map[string]int, len(newOptions))
+	if optionTag != "" {
+		return F.ToString(a.providerTag, "_", optionTag)
+	}
+	return F.ToString(a.providerTag, "_", index, a.additionalSuffix)
+}
+
+type PreparedOutboundUpdate struct {
+	adapter     *Adapter
+	options     []option.Outbound
+	newTagSet   map[string]struct{}
+	transaction adapter.OutboundTransaction
+	finished    bool
+}
+
+func (a *Adapter) PrepareUpdateOutbounds(newOptions []option.Outbound) (*PreparedOutboundUpdate, error) {
+	a.updateAccess.Lock()
+	unlockOnError := true
+	defer func() {
+		if unlockOnError {
+			a.updateAccess.Unlock()
+		}
+	}()
+
+	preparedOptions := cloneProviderOutbounds(newOptions)
+	providerParser.PrefixProviderDetours(a.providerTag, a.additionalPrefix, preparedOptions)
+
+	newTagSet := make(map[string]struct{}, len(newOptions))
 	for index, outboundOptions := range newOptions {
-		tag := providerOutboundTag(a.providerTag, outboundOptions.Tag, index)
-		if _, exists := newIndexByTag[tag]; exists {
+		tag := a.providerOutboundTag(outboundOptions.Tag, index)
+		if _, exists := newTagSet[tag]; exists {
 			return nil, E.New("duplicate provider outbound tag: ", tag)
 		}
-		newOptionByTag[tag] = outboundOptions
-		newIndexByTag[tag] = index
+		newTagSet[tag] = struct{}{}
 	}
 
-	// A Provider may replace only outbounds it already owns. Without this
-	// preflight check, a subscription node such as provider/node could silently
-	// replace a statically configured outbound or a node owned by another Provider.
 	a.outboundsAccess.RLock()
+	currentOutbounds := append([]adapter.Outbound(nil), a.outbounds...)
 	ownedTags := make(map[string]struct{}, len(a.outboundsByTag))
 	for tag := range a.outboundsByTag {
 		ownedTags[tag] = struct{}{}
 	}
 	a.outboundsAccess.RUnlock()
-	for tag := range newIndexByTag {
+	for tag := range newTagSet {
 		if _, owned := ownedTags[tag]; owned {
 			continue
 		}
@@ -158,131 +180,121 @@ func (a *Adapter) UpdateOutbounds(oldOptions []option.Outbound, newOptions []opt
 		}
 	}
 
-	creationOrder, dependencies, err := providerCreationOrder(a.providerTag, preparedOptions)
+	creationOrder, _, err := a.providerCreationOrder(preparedOptions)
 	if err != nil {
 		return nil, err
 	}
-	ownChanged := make(map[string]bool, len(newOptions))
-	for tag, outboundOptions := range newOptionByTag {
-		oldOptions, existedBefore := oldOptionByTag[tag]
-		_, exists := a.outbound.Outbound(tag)
-		ownChanged[tag] = !exists || !existedBefore || !reflect.DeepEqual(outboundOptions, oldOptions)
+	transactionManager, loaded := a.outbound.(adapter.OutboundTransactionManager)
+	if !loaded {
+		return nil, E.New("outbound manager does not support provider transactions")
 	}
-
-	outboundByTag := make(map[string]adapter.Outbound, len(newOptions))
-	effectiveOptionByTag := make(map[string]option.Outbound, len(newOptions))
-	replaced := make(map[string]bool, len(newOptions))
-	failed := make(map[string]bool, len(newOptions))
-	var updateErr error
+	replaceTags := make([]string, 0, len(currentOutbounds))
+	for _, outbound := range currentOutbounds {
+		replaceTags = append(replaceTags, outbound.Tag())
+	}
+	items := make([]adapter.OutboundBatchItem, 0, len(preparedOptions))
 	for _, index := range creationOrder {
 		outboundOptions := preparedOptions[index]
-		canonicalOptions := newOptions[index]
-		tag := providerOutboundTag(a.providerTag, canonicalOptions.Tag, index)
-		dependency := dependencies[tag]
-		outbound, exists := a.outbound.Outbound(tag)
-		if dependency != "" && failed[dependency] {
-			failed[tag] = true
-			updateErr = E.Errors(updateErr, E.New("skip provider outbound ", tag, ": dependency update failed: ", dependency))
-			continue
-		}
-		dependencyReplaced := dependency != "" && replaced[dependency]
-		if ownChanged[tag] || dependencyReplaced {
-			createErr := a.outbound.Create(
-				adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: tag}),
-				a.router,
-				a.logFactory.NewLogger(F.ToString("outbound/", outboundOptions.Type, "[", tag, "]")),
-				tag,
-				outboundOptions.Type,
-				outboundOptions.Options,
-			)
-			if createErr != nil {
-				updateErr = E.Errors(updateErr, E.Cause(createErr, "create provider outbound ", tag))
-				if exists && !dependencyReplaced {
-					outboundByTag[tag] = outbound
-					if oldOptions, loaded := oldOptionByTag[tag]; loaded {
-						effectiveOptionByTag[tag] = oldOptions
-					}
-				} else {
-					failed[tag] = true
-				}
-				continue
-			}
-			replaced[tag] = true
-			outbound, exists = a.outbound.Outbound(tag)
-		}
-		if !exists || outbound == nil {
-			failed[tag] = true
-			updateErr = E.Errors(updateErr, E.New("provider outbound not found after creation: ", tag))
-			continue
-		}
-		outboundByTag[tag] = outbound
-		effectiveOptionByTag[tag] = canonicalOptions
+		tag := a.providerOutboundTag(newOptions[index].Tag, index)
+		items = append(items, adapter.OutboundBatchItem{
+			Context: adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: tag}),
+			Router:  a.router,
+			Logger:  a.logFactory.NewLogger(F.ToString("outbound/", outboundOptions.Type, "[", tag, "]")),
+			Tag:     tag,
+			Type:    outboundOptions.Type,
+			Options: outboundOptions.Options,
+		})
 	}
+	transaction, err := transactionManager.PrepareOutbounds(replaceTags, items)
+	if err != nil {
+		return nil, err
+	}
+	unlockOnError = false
+	return &PreparedOutboundUpdate{
+		adapter:     a,
+		options:     append([]option.Outbound(nil), newOptions...),
+		newTagSet:   newTagSet,
+		transaction: transaction,
+	}, nil
+}
 
-	// When a dependency was replaced, an old dependent cannot safely remain in
-	// the manager after its recreation fails because it still holds the closed
-	// dependency object. Remove failed branches from leaves to roots.
-	failedOutbounds := make([]adapter.Outbound, 0, len(failed))
-	for index := len(creationOrder) - 1; index >= 0; index-- {
-		optionIndex := creationOrder[index]
-		tag := providerOutboundTag(a.providerTag, newOptions[optionIndex].Tag, optionIndex)
-		if !failed[tag] {
-			continue
-		}
-		if outbound, exists := a.outbound.Outbound(tag); exists && outbound != nil {
-			failedOutbounds = append(failedOutbounds, outbound)
-		}
+func (u *PreparedOutboundUpdate) Abort() error {
+	if u == nil || u.finished {
+		return nil
 	}
-	if removeErr := a.removeProviderOutbounds(failedOutbounds); removeErr != nil {
-		updateErr = E.Errors(updateErr, removeErr)
-	}
+	u.finished = true
+	err := u.transaction.Abort()
+	u.adapter.updateAccess.Unlock()
+	return err
+}
 
-	currentOutbounds := a.Outbounds()
-	obsolete := make([]adapter.Outbound, 0)
-	for _, outbound := range currentOutbounds {
-		if _, exists := newIndexByTag[outbound.Tag()]; !exists {
-			obsolete = append(obsolete, outbound)
-		}
+func (u *PreparedOutboundUpdate) Commit(beforePublish func() error) ([]option.Outbound, error) {
+	if u == nil || u.finished {
+		return nil, E.New("provider outbound update is already finished")
 	}
-	if removeErr := a.removeProviderOutbounds(obsolete); removeErr != nil {
-		updateErr = E.Errors(updateErr, removeErr)
-		for _, outbound := range obsolete {
-			remaining, exists := a.outbound.Outbound(outbound.Tag())
-			if !exists || remaining == nil {
-				continue
-			}
-			outboundByTag[outbound.Tag()] = remaining
-			if oldOptions, loaded := oldOptionByTag[outbound.Tag()]; loaded {
-				effectiveOptionByTag[outbound.Tag()] = oldOptions
+	u.finished = true
+	a := u.adapter
+	created := u.transaction.Outbounds()
+	outboundByTag := make(map[string]adapter.Outbound, len(created))
+	for _, outbound := range created {
+		outboundByTag[outbound.Tag()] = outbound
+	}
+	orderedOutbounds := make([]adapter.Outbound, 0, len(u.options))
+	for index, outboundOptions := range u.options {
+		tag := a.providerOutboundTag(outboundOptions.Tag, index)
+		outbound := outboundByTag[tag]
+		if outbound == nil {
+			_ = u.transaction.Abort()
+			a.updateAccess.Unlock()
+			return nil, E.New("provider outbound missing before transaction commit: ", tag)
+		}
+		orderedOutbounds = append(orderedOutbounds, outbound)
+	}
+	preparations, err := a.prepareGroupUpdates(orderedOutbounds)
+	if err != nil {
+		_ = u.transaction.Abort()
+		a.updateAccess.Unlock()
+		return nil, err
+	}
+	preparationsCommitted := false
+	publish := func() error {
+		if beforePublish != nil {
+			if err := beforePublish(); err != nil {
+				return err
 			}
 		}
+		for _, preparation := range preparations {
+			preparation.Commit()
+		}
+		preparationsCommitted = true
+		return nil
 	}
-
-	outbounds := make([]adapter.Outbound, 0, len(outboundByTag))
-	effectiveOptions := make([]option.Outbound, 0, len(effectiveOptionByTag))
-	for index, outboundOptions := range newOptions {
-		tag := providerOutboundTag(a.providerTag, outboundOptions.Tag, index)
-		if outbound := outboundByTag[tag]; outbound != nil {
-			outbounds = append(outbounds, outbound)
-			effectiveOptions = append(effectiveOptions, effectiveOptionByTag[tag])
+	replaced, err := u.transaction.Commit(publish)
+	if err != nil {
+		if !preparationsCommitted {
+			for index := len(preparations) - 1; index >= 0; index-- {
+				preparations[index].Abort()
+			}
 		}
-	}
-	for _, outbound := range obsolete {
-		if _, stillPresent := outboundByTag[outbound.Tag()]; !stillPresent {
-			continue
-		}
-		if _, inNew := newIndexByTag[outbound.Tag()]; inNew {
-			continue
-		}
-		outbounds = append(outbounds, outbound)
-		effectiveOptions = append(effectiveOptions, effectiveOptionByTag[outbound.Tag()])
+		a.updateAccess.Unlock()
+		return nil, err
 	}
 
 	a.outboundsAccess.Lock()
-	a.outbounds = outbounds
+	a.outbounds = orderedOutbounds
 	a.outboundsByTag = outboundByTag
 	a.outboundsAccess.Unlock()
+	a.UpdateGroups()
 
+	for index := len(replaced) - 1; index >= 0; index-- {
+		outbound := replaced[index]
+		if _, retained := u.newTagSet[outbound.Tag()]; !retained && a.history != nil {
+			a.history.DeleteURLTestHistory(outbound.Tag())
+		}
+		if closeErr := common.Close(outbound); closeErr != nil {
+			a.logger.Error(E.Cause(closeErr, "close replaced provider outbound [", outbound.Tag(), "]"))
+		}
+	}
 	if a.enabled && a.history != nil {
 		go func() {
 			if _, err := a.HealthCheck(a.ctx); err != nil {
@@ -290,7 +302,16 @@ func (a *Adapter) UpdateOutbounds(oldOptions []option.Outbound, newOptions []opt
 			}
 		}()
 	}
-	return effectiveOptions, updateErr
+	a.updateAccess.Unlock()
+	return append([]option.Outbound(nil), u.options...), nil
+}
+
+func (a *Adapter) UpdateOutbounds(_ []option.Outbound, newOptions []option.Outbound) ([]option.Outbound, error) {
+	update, err := a.PrepareUpdateOutbounds(newOptions)
+	if err != nil {
+		return nil, err
+	}
+	return update.Commit(nil)
 }
 
 func cloneProviderOutbounds(outbounds []option.Outbound) []option.Outbound {
@@ -308,10 +329,10 @@ func cloneProviderOutbounds(outbounds []option.Outbound) []option.Outbound {
 	return cloned
 }
 
-func providerCreationOrder(providerTag string, outbounds []option.Outbound) ([]int, map[string]string, error) {
+func (a *Adapter) providerCreationOrder(outbounds []option.Outbound) ([]int, map[string]string, error) {
 	indexByTag := make(map[string]int, len(outbounds))
 	for index, outboundOptions := range outbounds {
-		tag := providerOutboundTag(providerTag, outboundOptions.Tag, index)
+		tag := a.providerOutboundTag(outboundOptions.Tag, index)
 		if _, exists := indexByTag[tag]; exists {
 			return nil, nil, E.New("duplicate provider outbound tag: ", tag)
 		}
@@ -319,7 +340,7 @@ func providerCreationOrder(providerTag string, outbounds []option.Outbound) ([]i
 	}
 	dependencies := make(map[string]string, len(outbounds))
 	for index, outboundOptions := range outbounds {
-		tag := providerOutboundTag(providerTag, outboundOptions.Tag, index)
+		tag := a.providerOutboundTag(outboundOptions.Tag, index)
 		dependency := providerDialerDetour(outboundOptions.Options)
 		if _, local := indexByTag[dependency]; local {
 			dependencies[tag] = dependency
@@ -346,7 +367,7 @@ func providerCreationOrder(providerTag string, outbounds []option.Outbound) ([]i
 		return nil
 	}
 	for index, outboundOptions := range outbounds {
-		tag := providerOutboundTag(providerTag, outboundOptions.Tag, index)
+		tag := a.providerOutboundTag(outboundOptions.Tag, index)
 		if err := visit(tag, nil); err != nil {
 			return nil, nil, err
 		}
@@ -398,6 +419,44 @@ func (a *Adapter) UnregisterCallback(element *list.Element[adapter.ProviderUpdat
 	a.callbacks.Remove(element)
 }
 
+func (a *Adapter) RegisterPrepareCallback(callback adapter.ProviderUpdatePrepareCallback) *list.Element[adapter.ProviderUpdatePrepareCallback] {
+	a.prepareCallbackAccess.Lock()
+	defer a.prepareCallbackAccess.Unlock()
+	return a.prepareCallbacks.PushBack(callback)
+}
+
+func (a *Adapter) UnregisterPrepareCallback(element *list.Element[adapter.ProviderUpdatePrepareCallback]) {
+	if element == nil {
+		return
+	}
+	a.prepareCallbackAccess.Lock()
+	defer a.prepareCallbackAccess.Unlock()
+	a.prepareCallbacks.Remove(element)
+}
+
+func (a *Adapter) prepareGroupUpdates(outbounds []adapter.Outbound) ([]adapter.ProviderUpdatePreparation, error) {
+	a.prepareCallbackAccess.Lock()
+	callbacks := make([]adapter.ProviderUpdatePrepareCallback, 0)
+	for element := a.prepareCallbacks.Front(); element != nil; element = element.Next() {
+		callbacks = append(callbacks, element.Value)
+	}
+	a.prepareCallbackAccess.Unlock()
+	preparations := make([]adapter.ProviderUpdatePreparation, 0, len(callbacks))
+	for _, callback := range callbacks {
+		preparation, err := callback(a.providerTag, outbounds)
+		if err != nil {
+			for index := len(preparations) - 1; index >= 0; index-- {
+				preparations[index].Abort()
+			}
+			return nil, err
+		}
+		if preparation != nil {
+			preparations = append(preparations, preparation)
+		}
+	}
+	return preparations, nil
+}
+
 func (a *Adapter) UpdateGroups() {
 	a.callbackAccess.Lock()
 	callbacks := make([]adapter.ProviderUpdateCallback, 0)
@@ -406,10 +465,19 @@ func (a *Adapter) UpdateGroups() {
 	}
 	a.callbackAccess.Unlock()
 	for _, callback := range callbacks {
-		if err := callback(a.providerTag); err != nil {
+		if err := callProviderUpdateCallback(callback, a.providerTag); err != nil {
 			a.logger.Error(E.Cause(err, "update groups for provider ", a.providerTag))
 		}
 	}
+}
+
+func callProviderUpdateCallback(callback adapter.ProviderUpdateCallback, providerTag string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = E.New("provider update callback panic: ", fmt.Sprint(recovered))
+		}
+	}()
+	return callback(providerTag)
 }
 
 func (a *Adapter) Close() error {
@@ -511,6 +579,9 @@ func (a *Adapter) removeProviderOutbounds(outbounds []adapter.Outbound) error {
 				continue
 			}
 			delete(lastErrors, outbound.Tag())
+			if a.history != nil {
+				a.history.DeleteURLTestHistory(outbound.Tag())
+			}
 			removed++
 		}
 		if removed == 0 {

@@ -3,11 +3,16 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type GroupCommonOptions struct {
-	Outbounds       []string          `json:"outbounds,omitempty"`
-	Providers       []string          `json:"providers,omitempty"`
-	Exclude         *badoption.Regexp `json:"exclude,omitempty"`
-	Include         *badoption.Regexp `json:"include,omitempty"`
-	UseAllProviders bool              `json:"use_all_providers,omitempty"`
+	Outbounds           []string          `json:"outbounds,omitempty"`
+	Providers           []string          `json:"providers,omitempty"`
+	Exclude             *badoption.Regexp `json:"exclude,omitempty"`
+	Include             *badoption.Regexp `json:"include,omitempty"`
+	ExcludeType         *badoption.Regexp `json:"exclude_type,omitempty"`
+	IncludeAll          bool              `json:"include_all,omitempty"`
+	IncludeAllOutbounds bool              `json:"include_all_outbounds,omitempty"`
+	UseAllProviders     bool              `json:"use_all_providers,omitempty"`
+	ExcludeAll          bool              `json:"exclude_all,omitempty"`
+	ExcludeTypeAll      bool              `json:"exclude_type_all,omitempty"`
 }
 
 type SelectorOutboundOptions struct {

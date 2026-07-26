@@ -161,6 +161,19 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
 	service.MustRegister[adapter.ProviderManager](ctx, providerManager)
+	staticOutboundTags := make([]string, 0, len(options.Outbounds))
+	for index, outboundOptions := range options.Outbounds {
+		switch outboundOptions.Type {
+		case C.TypeSelector, C.TypeURLTest, C.TypeDNS:
+			continue
+		}
+		tag := outboundOptions.Tag
+		if tag == "" {
+			tag = F.ToString(index)
+		}
+		staticOutboundTags = append(staticOutboundTags, tag)
+	}
+	service.MustRegister[adapter.StaticOutboundMetadata](ctx, adapter.StaticOutboundMetadata{Tags: staticOutboundTags})
 
 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions)
 	if err != nil {
@@ -403,6 +416,12 @@ func (s *Box) preStart() error {
 	err = adapter.Start(adapter.StartStateStart, s.outbound, s.provider, s.network, s.connection, s.router)
 	if err != nil {
 		return err
+	}
+	for _, currentOutbound := range s.outbound.Outbounds() {
+		group, isGroup := currentOutbound.(adapter.OutboundGroup)
+		if isGroup && len(group.All()) == 0 {
+			return E.New("outbound group[", currentOutbound.Tag(), "] has no available outbound")
+		}
 	}
 	return nil
 }

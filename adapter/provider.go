@@ -49,3 +49,24 @@ type SubscriptionInfo struct {
 }
 
 type ProviderUpdateCallback = func(tag string) error
+
+// ProviderUpdatePreparation holds a prepared Group state while a Provider
+// outbound transaction is waiting to publish. Commit must not fail; Abort
+// releases any locks or temporary state acquired during preparation.
+type ProviderUpdatePreparation interface {
+	Commit()
+	Abort()
+}
+
+// ProviderUpdatePrepareCallback validates and prepares dependent Group state
+// against a complete candidate Provider outbound set before that set is
+// published to the live outbound manager.
+type ProviderUpdatePrepareCallback = func(tag string, outbounds []Outbound) (ProviderUpdatePreparation, error)
+
+// ProviderUpdatePreparer is an optional extension implemented by the built-in
+// Provider adapter. Groups use it to participate in the same publication
+// transaction as Provider nodes.
+type ProviderUpdatePreparer interface {
+	RegisterPrepareCallback(callback ProviderUpdatePrepareCallback) *list.Element[ProviderUpdatePrepareCallback]
+	UnregisterPrepareCallback(element *list.Element[ProviderUpdatePrepareCallback])
+}

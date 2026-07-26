@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -29,8 +30,10 @@ import (
 )
 
 const (
-	providerRequestTimeout  = 30 * time.Second
-	maxProviderResponseSize = 16 << 20
+	providerRequestTimeout   = 30 * time.Second
+	providerUpdateRetryBase  = time.Minute
+	providerUpdateRetryLimit = 30 * time.Minute
+	maxProviderResponseSize  = 16 << 20
 )
 
 func RegisterProvider(registry *adapterProvider.Registry) {
@@ -45,16 +48,13 @@ var (
 
 type ProviderRemote struct {
 	adapterProvider.Adapter
-	ctx          context.Context
-	cancel       context.CancelFunc
-	logger       log.ContextLogger
-	outbound     adapter.OutboundManager
-	cacheFile    adapter.CacheFile
-	cacheKey     string
-	dialer       N.Dialer
-	tickerAccess sync.Mutex
-	ticker       *time.Ticker
-	fetchAccess  sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	logger      log.ContextLogger
+	outbound    adapter.OutboundManager
+	cacheFile   adapter.CacheFile
+	cacheKey    string
+	fetchAccess sync.Mutex
 
 	stateAccess      sync.RWMutex
 	lastEtag         string
@@ -94,7 +94,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	}
 	logger := logFactory.NewLogger(F.ToString("provider/remote[", tag, "]"))
 	return &ProviderRemote{
-		Adapter:           adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
+		Adapter:           adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck, options.AdditionalPrefix, options.AdditionalSuffix),
 		ctx:               ctx,
 		cancel:            cancel,
 		logger:            logger,
@@ -119,25 +119,16 @@ func (s *ProviderRemote) Start() error {
 				s.logger.Warn(E.Cause(err, "restore cached outbound provider"))
 			} else {
 				loadedCache = true
-				s.UpdateGroups()
 			}
 		}
 	}
 
-	if s.downloadDetour != "" {
-		detour, loaded := s.outbound.Outbound(s.downloadDetour)
-		if !loaded {
-			return E.New("detour outbound not found: ", s.downloadDetour)
-		}
-		s.dialer = detour
-	} else {
-		s.dialer = s.outbound.Default()
-	}
-	if s.dialer == nil {
-		return E.New("missing download dialer")
+	if _, err := s.downloadDialer(); err != nil {
+		return err
 	}
 
 	lastUpdated := s.UpdatedAt()
+	initialUpdateDelay := time.Duration(-1)
 	if !loadedCache {
 		if err := s.fetch(s.ctx); err != nil {
 			return E.Cause(err, "initial outbound provider update")
@@ -145,13 +136,17 @@ func (s *ProviderRemote) Start() error {
 	} else if !s.disableAutoUpdate && time.Since(lastUpdated) >= s.updateInterval {
 		if err := s.fetch(s.ctx); err != nil {
 			s.logger.Warn(E.Cause(err, "refresh cached outbound provider"))
+			initialUpdateDelay = providerUpdateRetryDelay(s.updateInterval, 1)
 		}
 	}
 	if err := s.Adapter.Start(); err != nil {
 		return err
 	}
 	if !s.disableAutoUpdate {
-		go s.loopUpdate()
+		if initialUpdateDelay < 0 {
+			initialUpdateDelay = s.nextUpdateDelay()
+		}
+		go s.loopUpdate(initialUpdateDelay)
 	}
 	return nil
 }
@@ -164,10 +159,15 @@ func (s *ProviderRemote) restoreCache(savedSubscription *adapter.SavedBinary) er
 		info = parsedInfo
 		content = remaining
 	}
-	if err := s.updateProviderFromContent(content); err != nil {
+	update, outboundOptions, err := s.prepareProviderFromContent(content)
+	if err != nil {
+		return err
+	}
+	if _, err = update.Commit(nil); err != nil {
 		return err
 	}
 	s.stateAccess.Lock()
+	s.lastOutOpts = outboundOptions
 	s.subscriptionInfo = info
 	s.lastUpdated = savedSubscription.LastUpdated
 	s.lastEtag = savedSubscription.LastEtag
@@ -176,11 +176,6 @@ func (s *ProviderRemote) restoreCache(savedSubscription *adapter.SavedBinary) er
 }
 
 func (s *ProviderRemote) Update() error {
-	s.tickerAccess.Lock()
-	if s.ticker != nil {
-		s.ticker.Reset(s.updateInterval)
-	}
-	s.tickerAccess.Unlock()
 	return s.fetch(s.ctx)
 }
 
@@ -198,12 +193,6 @@ func (s *ProviderRemote) SubscriptionInfo() adapter.SubscriptionInfo {
 
 func (s *ProviderRemote) Close() error {
 	s.cancel()
-	s.tickerAccess.Lock()
-	if s.ticker != nil {
-		s.ticker.Stop()
-		s.ticker = nil
-	}
-	s.tickerAccess.Unlock()
 
 	// Wait for an in-flight download/parse/update transaction before removing
 	// its dynamic outbounds. Otherwise a nearly completed fetch could recreate
@@ -211,6 +200,29 @@ func (s *ProviderRemote) Close() error {
 	s.fetchAccess.Lock()
 	s.fetchAccess.Unlock()
 	return common.Close(&s.Adapter)
+}
+
+func (s *ProviderRemote) downloadDialer() (N.Dialer, error) {
+	if s.downloadDetour != "" {
+		detour, loaded := s.outbound.Outbound(s.downloadDetour)
+		if !loaded || detour == nil {
+			return nil, E.New("detour outbound not found: ", s.downloadDetour)
+		}
+		return detour, nil
+	}
+	dialer := s.outbound.Default()
+	if dialer == nil {
+		return nil, E.New("missing download dialer")
+	}
+	return dialer, nil
+}
+
+func (s *ProviderRemote) dialDownloadContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	dialer, err := s.downloadDialer()
+	if err != nil {
+		return nil, err
+	}
+	return dialer.DialContext(ctx, network, destination)
 }
 
 func (s *ProviderRemote) fetch(ctx context.Context) error {
@@ -225,12 +237,12 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	requestContext, cancel := context.WithTimeout(ctx, providerRequestTimeout)
 	defer cancel()
 
-	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
+	s.logger.Debug("updating outbound provider ", s.Tag())
 	transport := &http.Transport{
 		ForceAttemptHTTP2:   true,
 		TLSHandshakeTimeout: C.TCPTimeout,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return s.dialer.DialContext(ctx, network, M.ParseSocksaddr(address))
+			return s.dialDownloadContext(ctx, network, M.ParseSocksaddr(address))
 		},
 		TLSClientConfig: &tls.Config{
 			Time: ntp.TimeFuncFromContext(ctx),
@@ -248,7 +260,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		request, requestErr := http.NewRequestWithContext(requestContext, http.MethodGet, s.url, nil)
 		if requestErr != nil {
-			return requestErr
+			return E.Cause(scrubProviderURLError(requestErr), "create provider request")
 		}
 		if lastEtag != "" {
 			request.Header.Set("If-None-Match", lastEtag)
@@ -257,6 +269,10 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		response, err = client.Do(request)
 		if err == nil {
 			break
+		}
+		if response != nil {
+			_ = response.Body.Close()
+			response = nil
 		}
 		if requestContext.Err() != nil {
 			return requestContext.Err()
@@ -270,7 +286,7 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		return err
+		return scrubProviderURLError(err)
 	}
 	if response == nil {
 		return E.New("empty provider response")
@@ -280,25 +296,27 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	infoString := response.Header.Get("subscription-userinfo")
 	info, hasInfo := parseInfo(infoString)
 	if response.StatusCode == http.StatusNotModified {
-		now := time.Now()
-		s.stateAccess.Lock()
-		if hasInfo {
-			s.subscriptionInfo = info
+		if len(s.Outbounds()) == 0 {
+			return E.New("provider returned 304 without an active cached outbound set")
 		}
-		s.lastUpdated = now
-		s.stateAccess.Unlock()
+		now := time.Now()
 		if s.cacheFile != nil {
 			savedSubscription := s.cacheFile.LoadSubscription(s.cacheKey)
-			if savedSubscription != nil {
-				if hasInfo {
-					savedSubscription.Content = updateCachedSubscriptionInfo(savedSubscription.Content, infoString)
-				}
-				savedSubscription.LastUpdated = now
-				if err := s.cacheFile.SaveSubscription(s.cacheKey, savedSubscription); err != nil {
-					s.logger.Error("save outbound provider cache file: ", err)
-				}
+			if savedSubscription == nil {
+				return E.New("provider returned 304 without cached subscription content")
+			}
+			if hasInfo {
+				savedSubscription.Content = updateCachedSubscriptionInfo(savedSubscription.Content, infoString)
+			}
+			savedSubscription.LastUpdated = now
+			if err := s.cacheFile.SaveSubscription(s.cacheKey, savedSubscription); err != nil {
+				return E.Cause(err, "save outbound provider cache file")
 			}
 		}
+		s.stateAccess.Lock()
+		s.subscriptionInfo = selectSubscriptionInfo(s.subscriptionInfo, info, hasInfo, true)
+		s.lastUpdated = now
+		s.stateAccess.Unlock()
 		s.logger.Info("update outbound provider ", s.Tag(), ": not modified")
 		return nil
 	}
@@ -319,34 +337,49 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 			content, _ = parser.DecodeBase64URLSafe(remaining)
 		}
 	}
-	if err := s.updateProviderFromContent(content); err != nil {
+
+	update, outboundOptions, err := s.prepareProviderFromContent(content)
+	if err != nil {
 		return err
 	}
-
 	now := time.Now()
 	etag := response.Header.Get("Etag")
-	s.stateAccess.Lock()
-	s.lastEtag = etag
-	s.subscriptionInfo = info
-	s.lastUpdated = now
-	lastEtag = s.lastEtag
-	s.stateAccess.Unlock()
-
-	if s.cacheFile != nil {
-		cacheContent := []byte(content)
-		if hasInfo {
-			cacheContent = append([]byte(infoString+"\n"), cacheContent...)
+	cacheContent := []byte(content)
+	if hasInfo {
+		cacheContent = append([]byte(infoString+"\n"), cacheContent...)
+	}
+	beforePublish := func() error {
+		if s.cacheFile == nil {
+			return nil
 		}
 		if err := s.cacheFile.SaveSubscription(s.cacheKey, &adapter.SavedBinary{
 			Content:     cacheContent,
 			LastUpdated: now,
-			LastEtag:    lastEtag,
+			LastEtag:    etag,
 		}); err != nil {
-			s.logger.Error("save outbound provider cache file: ", err)
+			return E.Cause(err, "save outbound provider cache file")
 		}
+		return nil
 	}
+	if _, err = update.Commit(beforePublish); err != nil {
+		return err
+	}
+
+	s.stateAccess.Lock()
+	s.lastOutOpts = outboundOptions
+	s.lastEtag = etag
+	s.subscriptionInfo = selectSubscriptionInfo(s.subscriptionInfo, info, hasInfo, false)
+	s.lastUpdated = now
+	s.stateAccess.Unlock()
 	s.logger.Info("updated outbound provider ", s.Tag())
 	return nil
+}
+
+func scrubProviderURLError(err error) error {
+	if urlErr, isURLError := err.(*url.Error); isURLError {
+		urlErr.URL = "<provider-url>"
+	}
+	return err
 }
 
 func readProviderResponse(reader io.Reader, contentLength int64) ([]byte, error) {
@@ -368,53 +401,122 @@ func providerCacheKey(tag string, rawURL string) string {
 	return F.ToString(tag, "#", hex.EncodeToString(sum[:]))
 }
 
-func (s *ProviderRemote) loopUpdate() {
-	ticker := time.NewTicker(s.updateInterval)
-	s.tickerAccess.Lock()
-	s.ticker = ticker
-	s.tickerAccess.Unlock()
-	defer func() {
-		ticker.Stop()
-		s.tickerAccess.Lock()
-		if s.ticker == ticker {
-			s.ticker = nil
+func nextProviderUpdateDelay(now time.Time, lastUpdated time.Time, updateInterval time.Duration) time.Duration {
+	if lastUpdated.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(lastUpdated)
+	if elapsed < 0 {
+		return updateInterval
+	}
+	if elapsed >= updateInterval {
+		return 0
+	}
+	return updateInterval - elapsed
+}
+
+func providerUpdateRetryDelay(updateInterval time.Duration, failureCount int) time.Duration {
+	limit := providerUpdateRetryLimit
+	if updateInterval > 0 && updateInterval < limit {
+		limit = updateInterval
+	}
+	if limit <= 0 {
+		limit = providerUpdateRetryBase
+	}
+	delay := providerUpdateRetryBase
+	for attempt := 1; attempt < failureCount && delay < limit; attempt++ {
+		if delay > limit/2 {
+			delay = limit
+			break
 		}
-		s.tickerAccess.Unlock()
-	}()
+		delay *= 2
+	}
+	if delay > limit {
+		delay = limit
+	}
+	return delay
+}
+
+func (s *ProviderRemote) nextUpdateDelay() time.Duration {
+	return nextProviderUpdateDelay(time.Now(), s.UpdatedAt(), s.updateInterval)
+}
+
+func (s *ProviderRemote) loopUpdate(initialDelay time.Duration) {
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	failureCount := 0
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
-			if err := s.fetch(s.ctx); err != nil {
-				s.logger.Error("update outbound provider: ", err)
+		case <-timer.C:
+			if delay := s.nextUpdateDelay(); delay > 0 {
+				failureCount = 0
+				timer.Reset(delay)
+				continue
 			}
+			if err := s.fetch(s.ctx); err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				failureCount++
+				s.logger.Error("update outbound provider: ", err)
+				timer.Reset(providerUpdateRetryDelay(s.updateInterval, failureCount))
+				continue
+			}
+			failureCount = 0
+			timer.Reset(s.nextUpdateDelay())
 		}
 	}
 }
 
+func (s *ProviderRemote) prepareProviderFromContent(content string) (*adapterProvider.PreparedOutboundUpdate, []option.Outbound, error) {
+	result, err := parser.ParseSubscriptionDetailed(s.ctx, content)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, skipped := range result.Skipped {
+		s.logger.Warn("skip provider outbound ", skipped.Tag, " (", skipped.Type, "): ", skipped.Reason)
+	}
+	outboundOptions := make([]option.Outbound, 0, len(result.Outbounds))
+	filtered := append([]parser.SkippedOutbound(nil), result.Skipped...)
+	for _, outbound := range result.Outbounds {
+		if s.exclude != nil && s.exclude.MatchString(outbound.Tag) {
+			filtered = append(filtered, parser.SkippedOutbound{Tag: outbound.Tag, Type: outbound.Type, Reason: "excluded by provider filter"})
+			continue
+		}
+		if s.include != nil && !s.include.MatchString(outbound.Tag) {
+			filtered = append(filtered, parser.SkippedOutbound{Tag: outbound.Tag, Type: outbound.Type, Reason: "not matched by provider include filter"})
+			continue
+		}
+		outboundOptions = append(outboundOptions, outbound)
+	}
+	if err := parser.ValidateSkippedDependencies(outboundOptions, filtered); err != nil {
+		return nil, nil, err
+	}
+	if err := parser.ValidateProviderOutbounds(outboundOptions); err != nil {
+		return nil, nil, err
+	}
+	s.NormalizeProviderTags(outboundOptions)
+	update, err := s.PrepareUpdateOutbounds(outboundOptions)
+	if err != nil {
+		return nil, nil, err
+	}
+	return update, outboundOptions, nil
+}
+
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOptions, err := parser.ParseSubscription(s.ctx, content)
+	update, outboundOptions, err := s.prepareProviderFromContent(content)
 	if err != nil {
 		return err
 	}
-	outboundOptions = common.Filter(outboundOptions, func(outbound option.Outbound) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(outbound.Tag)) && (s.include == nil || s.include.MatchString(outbound.Tag))
-	})
-	if err := parser.ValidateProviderOutbounds(outboundOptions); err != nil {
+	if _, err = update.Commit(nil); err != nil {
 		return err
 	}
-	parser.NormalizeProviderTags(outboundOptions)
-
-	s.stateAccess.RLock()
-	oldOptions := append([]option.Outbound(nil), s.lastOutOpts...)
-	s.stateAccess.RUnlock()
-	effectiveOptions, updateErr := s.UpdateOutbounds(oldOptions, outboundOptions)
 	s.stateAccess.Lock()
-	s.lastOutOpts = effectiveOptions
+	s.lastOutOpts = outboundOptions
 	s.stateAccess.Unlock()
-	s.UpdateGroups()
-	return updateErr
+	return nil
 }
 
 func getFirstLine(content string) (string, string) {
@@ -431,6 +533,16 @@ func updateCachedSubscriptionInfo(content []byte, infoString string) []byte {
 		return []byte(infoString + "\n" + remaining)
 	}
 	return append([]byte(infoString+"\n"), content...)
+}
+
+func selectSubscriptionInfo(current adapter.SubscriptionInfo, next adapter.SubscriptionInfo, hasNext bool, retainMissing bool) adapter.SubscriptionInfo {
+	if hasNext {
+		return next
+	}
+	if retainMissing {
+		return current
+	}
+	return adapter.SubscriptionInfo{}
 }
 
 func parseInfo(infoString string) (adapter.SubscriptionInfo, bool) {

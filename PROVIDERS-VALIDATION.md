@@ -7,7 +7,9 @@
 - GitHub Actions workflow YAML files were parsed successfully.
 - No AnyTLS implementation was included in Provider code.
 - Internal sing-box call sites use the Provider registry when creating a configuration context.
-- The Provider parser is restricted to outbound types present in sing-box 1.11.15.
+- Unknown outbound types are filtered before formal decoding; malformed retained supported types remain fatal.
+- Provider batches are staged outside the live OutboundManager and published only after complete construction.
+- Selector/URLTest candidates are prepared before Provider publication, with old-object and URLTest-history cleanup checks.
 - Cache restoration was audited to prevent repeated provider-tag prefixing.
 
 ## Online CI validation included
@@ -22,10 +24,11 @@ It performs:
 
 1. `go mod download` and `go mod verify`.
 2. `go mod tidy` and a module-file diff check.
-3. Provider parser and adapter unit tests.
-4. Compilation checks for local/remote Providers, groups, cache file, and Clash API.
-5. A full tagged command-line build.
-6. A real `sing-box check` using an inline Provider and selector.
+3. Provider parser, outbound transaction, Provider manager, Group-filter and remote-limit unit tests.
+4. Focused race tests for outbound transactions, Provider callbacks and Group refresh.
+5. Compilation checks for local/remote Providers, groups, cache file, and Clash API.
+6. A full tagged command-line build.
+7. Real `sing-box check` runs with and without Providers.
 
 ## Recommended runtime regression tests
 
@@ -38,7 +41,11 @@ It performs:
 - VLESS + REALITY + Vision node imported from sing-box JSON.
 - VLESS, VMess, Trojan, Hysteria2, TUIC, and Shadowsocks nodes imported from Clash YAML.
 - Raw/Base64 URI subscription import.
-- Provider update failure while old nodes remain operational.
+- Provider update failure while old nodes and Group membership remain operational.
+- Unsupported sing-box/Clash/URI node types skipped while retained supported nodes load.
+- Malformed retained supported nodes reject startup/update without a partial publish.
+- `include_all`, `include_all_outbounds`, `use_all_providers`, `exclude_all`, and `exclude_type_all` scope checks.
+- Provider replacement with the same tags rebinds Selector/URLTest to the new objects.
 
 ## Validation limitation
 

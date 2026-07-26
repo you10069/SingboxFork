@@ -24,6 +24,7 @@ type Manager struct {
 	endpoint                adapter.EndpointManager
 	defaultTag              string
 	access                  sync.Mutex
+	transactionAccess       sync.Mutex
 	started                 bool
 	stage                   adapter.StartStage
 	outbounds               []adapter.Outbound
@@ -145,15 +146,16 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 }
 
 func (m *Manager) Close() error {
+	m.transactionAccess.Lock()
+	defer m.transactionAccess.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
-		m.access.Unlock()
-		return nil
-	}
 	m.started = false
 	outbounds := m.outbounds
 	m.outbounds = nil
+	m.outboundByTag = make(map[string]adapter.Outbound)
+	m.dependByTag = make(map[string][]string)
+	m.defaultOutbound = nil
 	m.access.Unlock()
 	var err error
 	for _, outbound := range outbounds {
@@ -165,7 +167,7 @@ func (m *Manager) Close() error {
 			monitor.Finish()
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Outbounds() []adapter.Outbound {
@@ -195,6 +197,8 @@ func (m *Manager) Default() adapter.Outbound {
 }
 
 func (m *Manager) Remove(tag string) error {
+	m.transactionAccess.Lock()
+	defer m.transactionAccess.Unlock()
 	m.access.Lock()
 	outbound, found := m.outboundByTag[tag]
 	if !found {
@@ -216,7 +220,6 @@ func (m *Manager) Remove(tag string) error {
 		panic("invalid outbound index")
 	}
 	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
-	started := m.started
 	if m.defaultOutbound == outbound {
 		if len(m.outbounds) > 0 {
 			m.defaultOutbound = m.outbounds[0]
@@ -227,10 +230,7 @@ func (m *Manager) Remove(tag string) error {
 	}
 	m.removeDependencyReferencesLocked(tag, outbound.Dependencies())
 	m.access.Unlock()
-	if started {
-		return common.Close(outbound)
-	}
-	return nil
+	return common.Close(outbound)
 }
 
 func (m *Manager) removeDependencyReferencesLocked(tag string, dependencies []string) {
@@ -247,6 +247,8 @@ func (m *Manager) removeDependencyReferencesLocked(tag string, dependencies []st
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
+	m.transactionAccess.Lock()
+	defer m.transactionAccess.Unlock()
 	if tag == "" {
 		return os.ErrInvalid
 	}

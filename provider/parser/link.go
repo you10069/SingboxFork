@@ -227,10 +227,17 @@ func parseTuicLink(link string) (option.Outbound, error) {
 }
 
 func parseVMessLink(link string) (option.Outbound, error) {
+	payload, loaded := strings.CutPrefix(link, "vmess://")
+	if !loaded {
+		return option.Outbound{}, E.New("invalid VMess link")
+	}
+	if payload == "" {
+		return option.Outbound{}, E.New("empty VMess link")
+	}
 	var proxy map[string]string
 	reg := regexp.MustCompile(`(\"[^:,]+?\"[ \t]*:[ \t]*)(\d+|true|false)`)
-	s := reg.ReplaceAllString(link, `$1"$2"`)
-	err := json.Unmarshal([]byte(s[8:]), &proxy)
+	payload = reg.ReplaceAllString(payload, `$1"$2"`)
+	err := json.Unmarshal([]byte(payload), &proxy)
 	if err != nil {
 		proxy = make(map[string]string)
 		linkURL, err := url.Parse(link)

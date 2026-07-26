@@ -47,8 +47,10 @@ func (h *Provider) UnmarshalJSONContext(ctx context.Context, content []byte) err
 }
 
 type ProviderLocalOptions struct {
-	Path        string                     `json:"path"`
-	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
+	Path             string                     `json:"path"`
+	AdditionalPrefix string                     `json:"additional_prefix,omitempty"`
+	AdditionalSuffix string                     `json:"additional_suffix,omitempty"`
+	HealthCheck      ProviderHealthCheckOptions `json:"health_check,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
@@ -57,6 +59,8 @@ type ProviderRemoteOptions struct {
 	DownloadDetour    string             `json:"download_detour,omitempty"`
 	UpdateInterval    badoption.Duration `json:"update_interval,omitempty"`
 	DisableAutoUpdate bool               `json:"disable_auto_update,omitempty"`
+	AdditionalPrefix  string             `json:"additional_prefix,omitempty"`
+	AdditionalSuffix  string             `json:"additional_suffix,omitempty"`
 
 	Exclude     *badoption.Regexp          `json:"exclude,omitempty"`
 	Include     *badoption.Regexp          `json:"include,omitempty"`
@@ -64,8 +68,10 @@ type ProviderRemoteOptions struct {
 }
 
 type ProviderInlineOptions struct {
-	Outbounds   []Outbound                 `json:"outbounds,omitempty"`
-	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
+	Outbounds        []Outbound                 `json:"outbounds,omitempty"`
+	AdditionalPrefix string                     `json:"additional_prefix,omitempty"`
+	AdditionalSuffix string                     `json:"additional_suffix,omitempty"`
+	HealthCheck      ProviderHealthCheckOptions `json:"health_check,omitempty"`
 }
 
 type ProviderHealthCheckOptions struct {

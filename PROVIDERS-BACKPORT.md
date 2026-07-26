@@ -23,18 +23,34 @@ Provider nodes are registered as:
 <provider tag>/<node tag>
 ```
 
-Selector and URLTest outbounds can consume providers through:
+Selector and URLTest outbounds can combine explicit static outbounds,
+automatically collected static outbounds and Provider nodes:
 
 ```json
 {
   "type": "selector",
   "tag": "select",
+  "outbounds": ["direct", "manual-node"],
   "providers": ["subscription"],
+
+  "include_all": false,
+  "include_all_outbounds": true,
+  "use_all_providers": true,
+
   "include": "Hong Kong|Japan",
   "exclude": "Expire|Traffic",
-  "use_all_providers": false
+  "exclude_all": false,
+  "exclude_type": "tuic|hysteria2",
+  "exclude_type_all": false
 }
 ```
+
+`include_all` enables both `include_all_outbounds` and
+`use_all_providers`. `include` applies to automatically collected static
+outbounds and Provider nodes. Explicit `outbounds` bypass `include`; they also
+bypass `exclude` and `exclude_type` unless the corresponding `*_all` option is
+set. Selector and URLTest outbounds are never automatically collected as
+static candidates.
 
 ## Remote provider example
 
@@ -151,7 +167,7 @@ This backport intentionally does not add:
 - kTLS.
 - sing-box 1.12 DNS, route, endpoint, or TLS-fragmentation changes.
 
-Provider subscription parsers reject non-proxy outbounds such as `direct`, `block`, `dns`, `selector`, and `urltest` inside a provider.
+Provider subscription parsers skip non-proxy outbounds such as `direct`, `block`, `dns`, `selector`, and `urltest`. Outbound types not registered in the current 1.11.15 build, such as AnyTLS, are also skipped with a warning. A retained supported outbound with invalid options rejects the complete Provider load or update.
 
 ## Build tags
 
@@ -161,7 +177,7 @@ Providers do not require a new build tag. Continue using the existing 1.11.15 ma
 CGO_ENABLED=0 go build \
   -trimpath \
   -tags 'with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_reality_server,with_acme,with_clash_api,with_ech' \
-  -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.11.15-utls-providers.2 -s -w -buildid=' \
+  -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.11.15-utls-providers.5 -s -w -buildid=' \
   -o sing-box \
   ./cmd/sing-box
 ```
@@ -182,4 +198,7 @@ GET  /providers/proxies/{name}/healthcheck
 - Remote subscription cache stores the decoded original subscription body, not runtime-prefixed outbound options. This prevents duplicate provider prefixes after restart.
 - Internal detours between nodes in the same provider are rewritten to the namespaced tags at runtime.
 - Empty or duplicate node tags are normalized before dynamic outbounds are created.
-- A provider update keeps the previous working node when recreation fails and its dependency has not changed.
+- Provider startup is strict: without a complete usable cache, download, parse or retained-node creation failure prevents `Box.Start()` from succeeding.
+- Runtime Provider updates are transactional. All retained nodes are staged and started before publication; any failure leaves the previous Provider, Group, cache, ETag and update time unchanged.
+- Selector and URLTest state is prepared against the complete candidate Provider set and published in the same transaction before replaced objects are closed.
+- URLTest history for permanently removed Provider tags is deleted after a successful commit.

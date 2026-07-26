@@ -39,6 +39,7 @@ type ProviderLocal struct {
 	watcher *fswatch.Watcher
 
 	reloadAccess sync.Mutex
+	closed       bool
 	stateAccess  sync.RWMutex
 	lastOutOpts  []option.Outbound
 	lastUpdated  time.Time
@@ -51,7 +52,7 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 	}
 	logger := logFactory.NewLogger(F.ToString("provider/inline[", tag, "]"))
 	result := &ProviderLocal{
-		Adapter: adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck),
+		Adapter: adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck, options.AdditionalPrefix, options.AdditionalSuffix),
 		ctx:     ctx,
 		logger:  logger,
 	}
@@ -59,13 +60,16 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 	if err := parser.ValidateProviderOutbounds(outboundOptions); err != nil {
 		return nil, err
 	}
-	parser.NormalizeProviderTags(outboundOptions)
-	effectiveOptions, err := result.UpdateOutbounds(nil, outboundOptions)
+	result.NormalizeProviderTags(outboundOptions)
+	update, err := result.PrepareUpdateOutbounds(outboundOptions)
 	if err != nil {
 		return nil, err
 	}
+	if _, err = update.Commit(nil); err != nil {
+		return nil, err
+	}
 	result.stateAccess.Lock()
-	result.lastOutOpts = effectiveOptions
+	result.lastOutOpts = outboundOptions
 	result.lastUpdated = time.Now()
 	result.stateAccess.Unlock()
 	return result, nil
@@ -81,7 +85,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 	}
 	logger := logFactory.NewLogger(F.ToString("provider/local[", tag, "]"))
 	result := &ProviderLocal{
-		Adapter: adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck),
+		Adapter: adapterProvider.NewAdapter(ctx, router, outboundManager, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck, options.AdditionalPrefix, options.AdditionalSuffix),
 		ctx:     ctx,
 		logger:  logger,
 	}
@@ -109,7 +113,7 @@ func (s *ProviderLocal) Start() error {
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Start(); err != nil {
-				s.logger.Error(E.Cause(err, "watch provider file"))
+				return E.Cause(err, "watch provider file")
 			}
 		}
 	}
@@ -125,37 +129,51 @@ func (s *ProviderLocal) UpdatedAt() time.Time {
 func (s *ProviderLocal) reloadFile(path string) error {
 	s.reloadAccess.Lock()
 	defer s.reloadAccess.Unlock()
+	if s.closed {
+		return nil
+	}
 
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	outboundOptions, err := parser.ParseSubscription(s.ctx, string(content))
+	result, err := parser.ParseSubscriptionDetailed(s.ctx, string(content))
 	if err != nil {
+		return err
+	}
+	for _, skipped := range result.Skipped {
+		s.logger.Warn("skip provider outbound ", skipped.Tag, " (", skipped.Type, "): ", skipped.Reason)
+	}
+	outboundOptions := result.Outbounds
+	if err := parser.ValidateSkippedDependencies(outboundOptions, result.Skipped); err != nil {
 		return err
 	}
 	if err := parser.ValidateProviderOutbounds(outboundOptions); err != nil {
 		return err
 	}
-	parser.NormalizeProviderTags(outboundOptions)
-
-	s.stateAccess.RLock()
-	oldOptions := append([]option.Outbound(nil), s.lastOutOpts...)
-	s.stateAccess.RUnlock()
-	effectiveOptions, updateErr := s.UpdateOutbounds(oldOptions, outboundOptions)
-	s.UpdateGroups()
+	s.NormalizeProviderTags(outboundOptions)
+	update, err := s.PrepareUpdateOutbounds(outboundOptions)
+	if err != nil {
+		return err
+	}
+	if _, err = update.Commit(nil); err != nil {
+		return err
+	}
 
 	updatedAt := time.Now()
 	if fileInfo, statErr := os.Stat(path); statErr == nil {
 		updatedAt = fileInfo.ModTime()
 	}
 	s.stateAccess.Lock()
-	s.lastOutOpts = effectiveOptions
+	s.lastOutOpts = append([]option.Outbound(nil), outboundOptions...)
 	s.lastUpdated = updatedAt
 	s.stateAccess.Unlock()
-	return updateErr
+	return nil
 }
 
 func (s *ProviderLocal) Close() error {
+	s.reloadAccess.Lock()
+	s.closed = true
+	s.reloadAccess.Unlock()
 	return common.Close(common.PtrOrNil(s.watcher), &s.Adapter)
 }

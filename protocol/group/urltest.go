@@ -40,12 +40,18 @@ type URLTest struct {
 	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
 	staticTags                   []string
+	automaticStaticTags          []string
 	providerTags                 []string
 	exclude                      *regexp.Regexp
 	include                      *regexp.Regexp
+	excludeType                  *regexp.Regexp
 	useAllProviders              bool
+	includeAllOutbounds          bool
+	excludeAll                   bool
+	excludeTypeAll               bool
 	providers                    map[string]adapter.Provider
 	callbacks                    []providerCallback
+	rebuildAccess                sync.Mutex
 	access                       sync.RWMutex
 	tags                         []string
 	link                         string
@@ -57,6 +63,13 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	includeAllOutbounds := options.IncludeAll || options.IncludeAllOutbounds
+	useAllProviders := options.IncludeAll || options.UseAllProviders
+	var automaticStaticTags []string
+	if includeAllOutbounds {
+		metadata := service.FromContext[adapter.StaticOutboundMetadata](ctx)
+		automaticStaticTags = append([]string(nil), metadata.Tags...)
+	}
 	result := &URLTest{
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
@@ -66,10 +79,15 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		staticTags:                   append([]string(nil), options.Outbounds...),
+		automaticStaticTags:          automaticStaticTags,
 		providerTags:                 append([]string(nil), options.Providers...),
 		exclude:                      (*regexp.Regexp)(options.Exclude),
 		include:                      (*regexp.Regexp)(options.Include),
-		useAllProviders:              options.UseAllProviders,
+		excludeType:                  (*regexp.Regexp)(options.ExcludeType),
+		useAllProviders:              useAllProviders,
+		includeAllOutbounds:          includeAllOutbounds,
+		excludeAll:                   options.ExcludeAll,
+		excludeTypeAll:               options.ExcludeTypeAll,
 		providers:                    make(map[string]adapter.Provider),
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
@@ -77,7 +95,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
-	if len(result.staticTags) == 0 && len(result.providerTags) == 0 && !result.useAllProviders {
+	if len(result.staticTags) == 0 && len(result.providerTags) == 0 && !result.useAllProviders && !result.includeAllOutbounds {
 		return nil, E.New("missing outbound and provider tags")
 	}
 	return result, nil
@@ -92,7 +110,14 @@ func (s *URLTest) Start() error {
 		for _, provider := range s.provider.Providers() {
 			s.providerTags = append(s.providerTags, provider.Tag())
 			s.providers[provider.Tag()] = provider
-			s.callbacks = append(s.callbacks, providerCallback{provider, provider.RegisterCallback(s.onProviderUpdated)})
+			callback := providerCallback{provider: provider}
+			if preparer, loaded := provider.(adapter.ProviderUpdatePreparer); loaded {
+				callback.preparer = preparer
+				callback.prepareElement = preparer.RegisterPrepareCallback(s.prepareProviderUpdated)
+			} else {
+				callback.element = provider.RegisterCallback(s.onProviderUpdated)
+			}
+			s.callbacks = append(s.callbacks, callback)
 		}
 	} else {
 		for index, tag := range s.providerTags {
@@ -101,10 +126,17 @@ func (s *URLTest) Start() error {
 				return E.New("outbound provider ", index, " not found: ", tag)
 			}
 			s.providers[tag] = provider
-			s.callbacks = append(s.callbacks, providerCallback{provider, provider.RegisterCallback(s.onProviderUpdated)})
+			callback := providerCallback{provider: provider}
+			if preparer, loaded := provider.(adapter.ProviderUpdatePreparer); loaded {
+				callback.preparer = preparer
+				callback.prepareElement = preparer.RegisterPrepareCallback(s.prepareProviderUpdated)
+			} else {
+				callback.element = provider.RegisterCallback(s.onProviderUpdated)
+			}
+			s.callbacks = append(s.callbacks, callback)
 		}
 	}
-	initialOutbounds, tags, err := s.collectOutbounds()
+	initialOutbounds, tags, err := s.collectOutbounds(nil)
 	if err != nil {
 		return err
 	}
@@ -131,7 +163,11 @@ func (s *URLTest) PostStart() error {
 
 func (s *URLTest) Close() error {
 	for _, callback := range s.callbacks {
-		callback.provider.UnregisterCallback(callback.element)
+		if callback.prepareElement != nil {
+			callback.preparer.UnregisterPrepareCallback(callback.prepareElement)
+		} else {
+			callback.provider.UnregisterCallback(callback.element)
+		}
 	}
 	s.callbacks = nil
 	s.access.RLock()
@@ -237,49 +273,103 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 	if _, loaded := s.providers[tag]; !loaded {
 		return E.New("outbound provider not found: ", tag)
 	}
-	outbounds, tags, err := s.collectOutbounds()
+	return s.rebuild(nil)
+}
+
+type urlTestState struct {
+	outbounds []adapter.Outbound
+	tags      []string
+}
+
+type urlTestProviderUpdatePreparation struct {
+	urlTest  *URLTest
+	state    urlTestState
+	finished bool
+}
+
+func (p *urlTestProviderUpdatePreparation) Commit() {
+	if p == nil || p.finished {
+		return
+	}
+	p.finished = true
+	p.urlTest.applyState(p.state)
+	p.urlTest.rebuildAccess.Unlock()
+}
+
+func (p *urlTestProviderUpdatePreparation) Abort() {
+	if p == nil || p.finished {
+		return
+	}
+	p.finished = true
+	p.urlTest.rebuildAccess.Unlock()
+}
+
+func (s *URLTest) prepareProviderUpdated(tag string, outbounds []adapter.Outbound) (adapter.ProviderUpdatePreparation, error) {
+	if _, loaded := s.providers[tag]; !loaded {
+		return nil, E.New("outbound provider not found: ", tag)
+	}
+	s.rebuildAccess.Lock()
+	state, err := s.buildState(map[string][]adapter.Outbound{tag: outbounds})
+	if err != nil {
+		s.rebuildAccess.Unlock()
+		return nil, err
+	}
+	s.access.RLock()
+	wasAvailable := len(s.tags) > 0
+	s.access.RUnlock()
+	if wasAvailable && len(state.tags) == 0 {
+		s.rebuildAccess.Unlock()
+		return nil, E.New("provider update would leave urltest[", s.Tag(), "] without an available outbound")
+	}
+	return &urlTestProviderUpdatePreparation{urlTest: s, state: state}, nil
+}
+
+func (s *URLTest) rebuild(providerOverrides map[string][]adapter.Outbound) error {
+	s.rebuildAccess.Lock()
+	defer s.rebuildAccess.Unlock()
+	state, err := s.buildState(providerOverrides)
 	if err != nil {
 		return err
 	}
-	s.access.Lock()
-	s.tags = tags
-	group := s.group
-	s.access.Unlock()
-	if group != nil {
-		group.UpdateOutbounds(outbounds)
-	}
+	s.applyState(state)
 	return nil
 }
 
-func (s *URLTest) collectOutbounds() ([]adapter.Outbound, []string, error) {
-	outbounds := make([]adapter.Outbound, 0)
-	tags := make([]string, 0)
-	for index, tag := range s.staticTags {
-		detour, loaded := s.outbound.Outbound(tag)
-		if !loaded {
-			return nil, nil, E.New("outbound ", index, " not found: ", tag)
-		}
-		tags = append(tags, tag)
-		outbounds = append(outbounds, detour)
+func (s *URLTest) buildState(providerOverrides map[string][]adapter.Outbound) (urlTestState, error) {
+	outbounds, tags, err := s.collectOutbounds(providerOverrides)
+	if err != nil {
+		return urlTestState{}, err
 	}
-	for _, providerTag := range s.providerTags {
-		provider := s.providers[providerTag]
-		if provider == nil {
-			continue
-		}
-		for _, detour := range provider.Outbounds() {
-			tag := detour.Tag()
-			if s.exclude != nil && s.exclude.MatchString(tag) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(tag) {
-				continue
-			}
-			tags = append(tags, tag)
-			outbounds = append(outbounds, detour)
-		}
+	return urlTestState{outbounds: outbounds, tags: tags}, nil
+}
+
+func (s *URLTest) applyState(state urlTestState) {
+	s.access.Lock()
+	s.tags = state.tags
+	group := s.group
+	s.access.Unlock()
+	if group != nil {
+		group.UpdateOutbounds(state.outbounds)
 	}
-	return outbounds, tags, nil
+}
+
+func (s *URLTest) collectOutbounds(providerOverrides map[string][]adapter.Outbound) ([]adapter.Outbound, []string, error) {
+	return collectGroupOutbounds(
+		s.outbound,
+		s.Tag(),
+		s.staticTags,
+		s.automaticStaticTags,
+		s.providerTags,
+		s.providers,
+		providerOverrides,
+		groupFilterOptions{
+			include:        s.include,
+			exclude:        s.exclude,
+			excludeType:    s.excludeType,
+			excludeAll:     s.excludeAll,
+			excludeTypeAll: s.excludeTypeAll,
+		},
+	)
 }
 
 type URLTestGroup struct {
@@ -568,6 +658,14 @@ func (g *URLTestGroup) performUpdateCheck() {
 	udpOutbound, udpExists := g.Select(N.NetworkUDP)
 	g.access.Lock()
 	updated := false
+	if !containsOutbound(g.outbounds, tcpOutbound) {
+		tcpOutbound = nil
+		tcpExists = false
+	}
+	if !containsOutbound(g.outbounds, udpOutbound) {
+		udpOutbound = nil
+		udpExists = false
+	}
 	if tcpOutbound != nil && (g.selectedOutboundTCP == nil || (tcpExists && tcpOutbound != g.selectedOutboundTCP)) {
 		updated = g.selectedOutboundTCP != nil
 		g.selectedOutboundTCP = tcpOutbound

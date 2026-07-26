@@ -17,9 +17,22 @@ func TestCloneProviderOutboundsKeepsCanonicalDetour(t *testing.T) {
 		{Tag: "child", Options: child},
 	}
 	prepared := cloneProviderOutbounds(canonical)
-	providerParser.PrefixProviderDetours("provider", prepared)
+	providerParser.PrefixProviderDetours("provider", "", prepared)
 
 	require.Equal(t, "base", child.Detour)
 	preparedChild := prepared[1].Options.(*option.VLESSOutboundOptions)
-	require.Equal(t, "provider/base", preparedChild.Detour)
+	require.Equal(t, "provider_base", preparedChild.Detour)
+}
+
+func TestProviderOutboundTagUsesAdditionalPrefixInsteadOfProviderTag(t *testing.T) {
+	adapter := Adapter{
+		providerTag:      "provider",
+		additionalPrefix: "[custom] ",
+		additionalSuffix: " suffix",
+	}
+	outbounds := []option.Outbound{{Tag: "node"}, {Tag: "node"}}
+	adapter.NormalizeProviderTags(outbounds)
+
+	require.Equal(t, "[custom] node suffix", adapter.providerOutboundTag(outbounds[0].Tag, 0))
+	require.Equal(t, "[custom] node suffix (2)", adapter.providerOutboundTag(outbounds[1].Tag, 1))
 }

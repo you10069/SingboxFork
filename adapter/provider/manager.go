@@ -59,10 +59,6 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 func (m *Manager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
-		m.access.Unlock()
-		return nil
-	}
 	m.started = false
 	providers := append([]adapter.Provider(nil), m.providers...)
 	m.providers = nil
@@ -101,10 +97,8 @@ func (m *Manager) Remove(tag string) error {
 	if !found {
 		return os.ErrInvalid
 	}
-	if m.started {
-		if err := common.Close(provider); err != nil {
-			return E.Cause(err, "close provider/", provider.Type(), "[", provider.Tag(), "]")
-		}
+	if err := common.Close(provider); err != nil {
+		return E.Cause(err, "close provider/", provider.Type(), "[", provider.Tag(), "]")
 	}
 	delete(m.providerByTag, tag)
 	index := common.Index(m.providers, func(it adapter.Provider) bool {
