@@ -384,7 +384,6 @@ type URLTestGroup struct {
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
-	checking                     atomic.Bool
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -395,6 +394,22 @@ type URLTestGroup struct {
 	closeOnce                    sync.Once
 	started                      bool
 	lastActive                   atomic.TypedValue[time.Time]
+
+	healthAccess         sync.Mutex
+	healthGeneration     uint64
+	healthRunning        bool
+	healthPending        bool
+	healthPendingForce   bool
+	healthCancel         context.CancelFunc
+	healthCurrentWaiters []chan urlTestHealthCheckResult
+	healthPendingWaiters []chan urlTestHealthCheckResult
+	healthWait           sync.WaitGroup
+	healthClosed         bool
+}
+
+type urlTestHealthCheckResult struct {
+	delays map[string]uint16
+	err    error
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -464,6 +479,7 @@ func (g *URLTestGroup) Selected(network string) adapter.Outbound {
 }
 
 func (g *URLTestGroup) UpdateOutbounds(outbounds []adapter.Outbound) {
+	g.healthAccess.Lock()
 	g.access.Lock()
 	g.outbounds = append([]adapter.Outbound(nil), outbounds...)
 	if !containsOutbound(g.outbounds, g.selectedOutboundTCP) {
@@ -477,9 +493,21 @@ func (g *URLTestGroup) UpdateOutbounds(outbounds []adapter.Outbound) {
 		g.ticker.Reset(g.interval)
 	}
 	g.access.Unlock()
+	g.healthGeneration++
+	requestCheck := started && !g.healthClosed
+	if g.healthRunning {
+		if requestCheck {
+			g.healthPending = true
+			g.healthPendingForce = true
+		}
+		if g.healthCancel != nil {
+			g.healthCancel()
+		}
+	}
+	g.healthAccess.Unlock()
 	g.performUpdateCheck()
-	if started {
-		go g.CheckOutbounds(true)
+	if requestCheck {
+		g.scheduleURLTest(g.ctx, true, true)
 	}
 }
 
@@ -506,6 +534,19 @@ func (g *URLTestGroup) Touch() {
 }
 
 func (g *URLTestGroup) Close() error {
+	g.healthAccess.Lock()
+	g.healthClosed = true
+	g.healthGeneration++
+	g.healthPending = false
+	g.healthPendingForce = false
+	if g.healthCancel != nil {
+		g.healthCancel()
+	}
+	pendingWaiters := g.healthPendingWaiters
+	g.healthPendingWaiters = nil
+	g.healthAccess.Unlock()
+	notifyURLTestHealthCheckWaiters(pendingWaiters, urlTestHealthCheckResult{err: context.Canceled})
+
 	g.access.Lock()
 	if g.ticker != nil {
 		g.ticker.Stop()
@@ -517,6 +558,7 @@ func (g *URLTestGroup) Close() error {
 	}
 	g.access.Unlock()
 	g.closeOnce.Do(func() { close(g.close) })
+	g.healthWait.Wait()
 	return nil
 }
 
@@ -600,20 +642,124 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	result := make(map[string]uint16)
-	if g.checking.Swap(true) {
-		return result, nil
+	waiter := make(chan urlTestHealthCheckResult, 1)
+	g.enqueueURLTest(ctx, force, true, waiter)
+	select {
+	case result := <-waiter:
+		return result.delays, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	defer g.checking.Store(false)
+}
+
+func (g *URLTestGroup) scheduleURLTest(ctx context.Context, force bool, queueIfRunning bool) {
+	g.enqueueURLTest(ctx, force, queueIfRunning, nil)
+}
+
+func (g *URLTestGroup) enqueueURLTest(ctx context.Context, force bool, queueIfRunning bool, waiter chan urlTestHealthCheckResult) {
+	g.healthAccess.Lock()
+	if g.healthClosed {
+		g.healthAccess.Unlock()
+		if waiter != nil {
+			waiter <- urlTestHealthCheckResult{err: context.Canceled}
+		}
+		return
+	}
+	if g.healthRunning {
+		if queueIfRunning {
+			g.healthPending = true
+			g.healthPendingForce = g.healthPendingForce || force
+			if waiter != nil {
+				g.healthPendingWaiters = append(g.healthPendingWaiters, waiter)
+			}
+		}
+		g.healthAccess.Unlock()
+		if waiter != nil && !queueIfRunning {
+			waiter <- urlTestHealthCheckResult{delays: make(map[string]uint16)}
+		}
+		return
+	}
+	g.healthRunning = true
+	if waiter != nil {
+		g.healthCurrentWaiters = append(g.healthCurrentWaiters, waiter)
+	}
+	g.healthWait.Add(1)
+	g.healthAccess.Unlock()
+	go g.urlTestWorker(ctx, force)
+}
+
+func (g *URLTestGroup) urlTestWorker(initialContext context.Context, initialForce bool) {
+	defer g.healthWait.Done()
+	checkContext := initialContext
+	force := initialForce
+	for {
+		g.healthAccess.Lock()
+		generation := g.healthGeneration
+		runContext, cancel := context.WithCancel(checkContext)
+		g.healthCancel = cancel
+		g.healthAccess.Unlock()
+
+		delays, err := g.runURLTest(runContext, force, generation)
+		cancel()
+
+		g.healthAccess.Lock()
+		currentWaiters := g.healthCurrentWaiters
+		g.healthCurrentWaiters = nil
+		if g.healthClosed {
+			pendingWaiters := g.healthPendingWaiters
+			g.healthPendingWaiters = nil
+			g.healthPending = false
+			g.healthPendingForce = false
+			g.healthCancel = nil
+			g.healthRunning = false
+			g.healthAccess.Unlock()
+			canceledResult := urlTestHealthCheckResult{err: context.Canceled}
+			notifyURLTestHealthCheckWaiters(currentWaiters, canceledResult)
+			notifyURLTestHealthCheckWaiters(pendingWaiters, canceledResult)
+			return
+		}
+		if g.healthPending {
+			g.healthPending = false
+			force = g.healthPendingForce
+			g.healthPendingForce = false
+			g.healthCurrentWaiters = g.healthPendingWaiters
+			g.healthPendingWaiters = nil
+			g.healthCancel = nil
+			g.healthAccess.Unlock()
+			notifyURLTestHealthCheckWaiters(currentWaiters, urlTestHealthCheckResult{delays: delays, err: err})
+			checkContext = g.ctx
+			continue
+		}
+		g.healthCancel = nil
+		g.healthRunning = false
+		g.healthAccess.Unlock()
+		notifyURLTestHealthCheckWaiters(currentWaiters, urlTestHealthCheckResult{delays: delays, err: err})
+		return
+	}
+}
+
+func notifyURLTestHealthCheckWaiters(waiters []chan urlTestHealthCheckResult, result urlTestHealthCheckResult) {
+	for _, waiter := range waiters {
+		waiter <- result
+	}
+}
+
+func (g *URLTestGroup) runURLTest(ctx context.Context, force bool, generation uint64) (map[string]uint16, error) {
+	result := make(map[string]uint16)
+	g.healthAccess.Lock()
+	if g.healthClosed || generation != g.healthGeneration {
+		g.healthAccess.Unlock()
+		return result, context.Canceled
+	}
 	g.access.RLock()
 	outbounds := append([]adapter.Outbound(nil), g.outbounds...)
 	g.access.RUnlock()
+	g.healthAccess.Unlock()
 	batchGroup, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
 	for _, detour := range outbounds {
 		detour := detour
-		tag := detour.Tag()
 		realTag := RealTag(detour)
 		if realTag == "" || checked[realTag] {
 			continue
@@ -631,26 +777,53 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			testContext, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
 			delay, err := urltest.URLTest(testContext, g.link, testOutbound)
-			if err != nil {
-				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				g.history.DeleteURLTestHistory(realTag)
-			} else {
-				g.logger.Debug("outbound ", tag, " available: ", delay, "ms")
-				g.history.StoreURLTestHistory(realTag, &urltest.History{Time: time.Now(), Delay: delay})
-				resultAccess.Lock()
-				result[tag] = delay
-				resultAccess.Unlock()
-			}
+			g.publishURLTestResult(generation, detour, realTag, testOutbound, delay, err, result, &resultAccess)
 			return nil, nil
 		})
 	}
 	batchGroup.Wait()
-	select {
-	case <-ctx.Done():
-	default:
-		g.performUpdateCheck()
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
+	g.performUpdateCheckForGeneration(generation)
 	return result, nil
+}
+
+func (g *URLTestGroup) publishURLTestResult(generation uint64, candidate adapter.Outbound, realTag string, testedOutbound adapter.Outbound, delay uint16, testErr error, result map[string]uint16, resultAccess *sync.Mutex) {
+	managerOutbound, managerLoaded := g.outbound.Outbound(realTag)
+	g.healthAccess.Lock()
+	defer g.healthAccess.Unlock()
+	if g.healthClosed || generation != g.healthGeneration {
+		return
+	}
+	g.access.RLock()
+	current := containsOutbound(g.outbounds, candidate) && RealTag(candidate) == realTag &&
+		managerLoaded && managerOutbound == testedOutbound
+	g.access.RUnlock()
+	if !current {
+		return
+	}
+	tag := candidate.Tag()
+	if testErr != nil {
+		g.logger.Debug("outbound ", tag, " unavailable: ", testErr)
+		g.history.DeleteURLTestHistory(realTag)
+		return
+	}
+	g.logger.Debug("outbound ", tag, " available: ", delay, "ms")
+	g.history.StoreURLTestHistory(realTag, &urltest.History{Time: time.Now(), Delay: delay})
+	resultAccess.Lock()
+	result[tag] = delay
+	resultAccess.Unlock()
+}
+
+func (g *URLTestGroup) performUpdateCheckForGeneration(generation uint64) {
+	g.healthAccess.Lock()
+	if g.healthClosed || generation != g.healthGeneration {
+		g.healthAccess.Unlock()
+		return
+	}
+	g.performUpdateCheck()
+	g.healthAccess.Unlock()
 }
 
 func (g *URLTestGroup) performUpdateCheck() {

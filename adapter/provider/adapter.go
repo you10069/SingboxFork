@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -42,8 +41,17 @@ type Adapter struct {
 
 	tickerAccess sync.Mutex
 	ticker       *time.Ticker
-	checking     atomic.Bool
 	history      *urltest.HistoryStorage
+
+	healthAccess         sync.Mutex
+	healthGeneration     uint64
+	healthRunning        bool
+	healthPending        bool
+	healthCancel         context.CancelFunc
+	healthCurrentWaiters []chan providerHealthCheckResult
+	healthPendingWaiters []chan providerHealthCheckResult
+	healthWait           sync.WaitGroup
+	healthClosed         bool
 
 	callbackAccess        sync.Mutex
 	callbacks             list.List[adapter.ProviderUpdateCallback]
@@ -54,6 +62,11 @@ type Adapter struct {
 	enabled  bool
 	timeout  time.Duration
 	interval time.Duration
+}
+
+type providerHealthCheckResult struct {
+	delays map[string]uint16
+	err    error
 }
 
 func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions, additionalPrefix string, additionalSuffix string) Adapter {
@@ -267,6 +280,7 @@ func (u *PreparedOutboundUpdate) Commit(beforePublish func() error) ([]option.Ou
 			preparation.Commit()
 		}
 		preparationsCommitted = true
+		a.publishOutbounds(orderedOutbounds, outboundByTag)
 		return nil
 	}
 	replaced, err := u.transaction.Commit(publish)
@@ -280,10 +294,6 @@ func (u *PreparedOutboundUpdate) Commit(beforePublish func() error) ([]option.Ou
 		return nil, err
 	}
 
-	a.outboundsAccess.Lock()
-	a.outbounds = orderedOutbounds
-	a.outboundsByTag = outboundByTag
-	a.outboundsAccess.Unlock()
 	a.UpdateGroups()
 
 	for index := len(replaced) - 1; index >= 0; index-- {
@@ -295,15 +305,32 @@ func (u *PreparedOutboundUpdate) Commit(beforePublish func() error) ([]option.Ou
 			a.logger.Error(E.Cause(closeErr, "close replaced provider outbound [", outbound.Tag(), "]"))
 		}
 	}
-	if a.enabled && a.history != nil {
-		go func() {
-			if _, err := a.HealthCheck(a.ctx); err != nil {
-				a.logger.Debug("provider health check: ", err)
-			}
-		}()
-	}
 	a.updateAccess.Unlock()
 	return append([]option.Outbound(nil), u.options...), nil
+}
+
+func (a *Adapter) publishOutbounds(outbounds []adapter.Outbound, outboundsByTag map[string]adapter.Outbound) {
+	a.healthAccess.Lock()
+	a.outboundsAccess.Lock()
+	a.outbounds = outbounds
+	a.outboundsByTag = outboundsByTag
+	a.outboundsAccess.Unlock()
+	a.healthGeneration++
+	requestCheck := a.enabled && a.history != nil && !a.healthClosed
+	if a.healthRunning {
+		if requestCheck {
+			a.healthPending = true
+		}
+		if a.healthCancel != nil {
+			a.healthCancel()
+		}
+		a.healthAccess.Unlock()
+		return
+	}
+	a.healthAccess.Unlock()
+	if requestCheck {
+		a.scheduleHealthCheck(a.ctx, true)
+	}
 }
 
 func (a *Adapter) UpdateOutbounds(_ []option.Outbound, newOptions []option.Outbound) ([]option.Outbound, error) {
@@ -489,6 +516,19 @@ func (a *Adapter) Close() error {
 	}
 	a.tickerAccess.Unlock()
 
+	a.healthAccess.Lock()
+	a.healthClosed = true
+	a.healthGeneration++
+	a.healthPending = false
+	if a.healthCancel != nil {
+		a.healthCancel()
+	}
+	pendingWaiters := a.healthPendingWaiters
+	a.healthPendingWaiters = nil
+	a.healthAccess.Unlock()
+	notifyProviderHealthCheckWaiters(pendingWaiters, providerHealthCheckResult{err: context.Canceled})
+	a.healthWait.Wait()
+
 	a.updateAccess.Lock()
 	defer a.updateAccess.Unlock()
 	a.outboundsAccess.Lock()
@@ -513,27 +553,129 @@ func (a *Adapter) loopCheck() {
 		}
 		a.tickerAccess.Unlock()
 	}()
-	_, _ = a.healthcheck(a.ctx)
+	a.scheduleHealthCheck(a.ctx, false)
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			_, _ = a.healthcheck(a.ctx)
+			a.scheduleHealthCheck(a.ctx, false)
 		}
 	}
 }
 
 func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
-	result := make(map[string]uint16)
-	if a.checking.Swap(true) {
-		return result, nil
+	waiter := make(chan providerHealthCheckResult, 1)
+	a.enqueueHealthCheck(ctx, true, waiter)
+	select {
+	case result := <-waiter:
+		return result.delays, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	defer a.checking.Store(false)
+}
+
+func (a *Adapter) scheduleHealthCheck(ctx context.Context, queueIfRunning bool) {
+	a.enqueueHealthCheck(ctx, queueIfRunning, nil)
+}
+
+func (a *Adapter) enqueueHealthCheck(ctx context.Context, queueIfRunning bool, waiter chan providerHealthCheckResult) {
+	a.healthAccess.Lock()
+	if a.healthClosed {
+		a.healthAccess.Unlock()
+		if waiter != nil {
+			waiter <- providerHealthCheckResult{err: context.Canceled}
+		}
+		return
+	}
+	if a.healthRunning {
+		if queueIfRunning {
+			a.healthPending = true
+			if waiter != nil {
+				a.healthPendingWaiters = append(a.healthPendingWaiters, waiter)
+			}
+		}
+		a.healthAccess.Unlock()
+		if waiter != nil && !queueIfRunning {
+			waiter <- providerHealthCheckResult{delays: make(map[string]uint16)}
+		}
+		return
+	}
+	a.healthRunning = true
+	if waiter != nil {
+		a.healthCurrentWaiters = append(a.healthCurrentWaiters, waiter)
+	}
+	a.healthWait.Add(1)
+	a.healthAccess.Unlock()
+	go a.healthCheckWorker(ctx)
+}
+
+func (a *Adapter) healthCheckWorker(initialContext context.Context) {
+	defer a.healthWait.Done()
+	checkContext := initialContext
+	for {
+		a.healthAccess.Lock()
+		generation := a.healthGeneration
+		runContext, cancel := context.WithCancel(checkContext)
+		a.healthCancel = cancel
+		a.healthAccess.Unlock()
+
+		delays, err := a.runHealthCheck(runContext, generation)
+		cancel()
+
+		a.healthAccess.Lock()
+		currentWaiters := a.healthCurrentWaiters
+		a.healthCurrentWaiters = nil
+		if a.healthClosed {
+			pendingWaiters := a.healthPendingWaiters
+			a.healthPendingWaiters = nil
+			a.healthPending = false
+			a.healthCancel = nil
+			a.healthRunning = false
+			a.healthAccess.Unlock()
+			canceledResult := providerHealthCheckResult{err: context.Canceled}
+			notifyProviderHealthCheckWaiters(currentWaiters, canceledResult)
+			notifyProviderHealthCheckWaiters(pendingWaiters, canceledResult)
+			return
+		}
+		if a.healthPending {
+			a.healthPending = false
+			a.healthCurrentWaiters = a.healthPendingWaiters
+			a.healthPendingWaiters = nil
+			a.healthCancel = nil
+			a.healthAccess.Unlock()
+			notifyProviderHealthCheckWaiters(currentWaiters, providerHealthCheckResult{delays: delays, err: err})
+			checkContext = a.ctx
+			continue
+		}
+		a.healthCancel = nil
+		a.healthRunning = false
+		a.healthAccess.Unlock()
+		notifyProviderHealthCheckWaiters(currentWaiters, providerHealthCheckResult{delays: delays, err: err})
+		return
+	}
+}
+
+func notifyProviderHealthCheckWaiters(waiters []chan providerHealthCheckResult, result providerHealthCheckResult) {
+	for _, waiter := range waiters {
+		waiter <- result
+	}
+}
+
+func (a *Adapter) runHealthCheck(ctx context.Context, generation uint64) (map[string]uint16, error) {
+	result := make(map[string]uint16)
 	if a.history == nil {
 		return result, nil
 	}
-	outbounds := a.Outbounds()
+	a.healthAccess.Lock()
+	if a.healthClosed || generation != a.healthGeneration {
+		a.healthAccess.Unlock()
+		return result, context.Canceled
+	}
+	a.outboundsAccess.RLock()
+	outbounds := append([]adapter.Outbound(nil), a.outbounds...)
+	a.outboundsAccess.RUnlock()
+	a.healthAccess.Unlock()
 	batchGroup, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	var resultAccess sync.Mutex
 	checked := make(map[string]bool)
@@ -548,21 +690,42 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 			testContext, cancel := context.WithTimeout(ctx, a.timeout)
 			defer cancel()
 			delay, err := urltest.URLTest(testContext, a.link, detour)
-			if err != nil {
-				a.logger.Debug("outbound ", tag, " unavailable: ", err)
-				a.history.DeleteURLTestHistory(tag)
-			} else {
-				a.logger.Debug("outbound ", tag, " available: ", delay, "ms")
-				a.history.StoreURLTestHistory(tag, &urltest.History{Time: time.Now(), Delay: delay})
-				resultAccess.Lock()
-				result[tag] = delay
-				resultAccess.Unlock()
-			}
+			a.publishHealthCheckResult(generation, detour, delay, err, result, &resultAccess)
 			return nil, nil
 		})
 	}
 	batchGroup.Wait()
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+func (a *Adapter) publishHealthCheckResult(generation uint64, outbound adapter.Outbound, delay uint16, testErr error, result map[string]uint16, resultAccess *sync.Mutex) {
+	tag := outbound.Tag()
+	managerOutbound, managerLoaded := a.outbound.Outbound(tag)
+	a.healthAccess.Lock()
+	defer a.healthAccess.Unlock()
+	if a.healthClosed || generation != a.healthGeneration {
+		return
+	}
+	a.outboundsAccess.RLock()
+	currentOutbound, providerLoaded := a.outboundsByTag[tag]
+	current := providerLoaded && currentOutbound == outbound && managerLoaded && managerOutbound == outbound
+	a.outboundsAccess.RUnlock()
+	if !current {
+		return
+	}
+	if testErr != nil {
+		a.logger.Debug("outbound ", tag, " unavailable: ", testErr)
+		a.history.DeleteURLTestHistory(tag)
+		return
+	}
+	a.logger.Debug("outbound ", tag, " available: ", delay, "ms")
+	a.history.StoreURLTestHistory(tag, &urltest.History{Time: time.Now(), Delay: delay})
+	resultAccess.Lock()
+	result[tag] = delay
+	resultAccess.Unlock()
 }
 
 func (a *Adapter) removeProviderOutbounds(outbounds []adapter.Outbound) error {
