@@ -478,19 +478,11 @@ func (s *ProviderRemote) prepareProviderFromContent(content string) (*adapterPro
 	for _, skipped := range result.Skipped {
 		s.logger.Warn("skip provider outbound ", skipped.Tag, " (", skipped.Type, "): ", skipped.Reason)
 	}
-	outboundOptions := make([]option.Outbound, 0, len(result.Outbounds))
-	filtered := append([]parser.SkippedOutbound(nil), result.Skipped...)
-	for _, outbound := range result.Outbounds {
-		if s.exclude != nil && s.exclude.MatchString(outbound.Tag) {
-			filtered = append(filtered, parser.SkippedOutbound{Tag: outbound.Tag, Type: outbound.Type, Reason: "excluded by provider filter"})
-			continue
-		}
-		if s.include != nil && !s.include.MatchString(outbound.Tag) {
-			filtered = append(filtered, parser.SkippedOutbound{Tag: outbound.Tag, Type: outbound.Type, Reason: "not matched by provider include filter"})
-			continue
-		}
-		outboundOptions = append(outboundOptions, outbound)
+	outboundOptions, remoteSkipped := filterRemoteProviderOutbounds(result.Outbounds, s.exclude, s.include)
+	for _, skipped := range remoteSkipped {
+		s.logger.Warn("skip provider outbound ", skipped.Tag, " (", skipped.Type, "): ", skipped.Reason)
 	}
+	filtered := append(append([]parser.SkippedOutbound(nil), result.Skipped...), remoteSkipped...)
 	if err := parser.ValidateSkippedDependencies(outboundOptions, filtered); err != nil {
 		return nil, nil, err
 	}
@@ -503,6 +495,28 @@ func (s *ProviderRemote) prepareProviderFromContent(content string) (*adapterPro
 		return nil, nil, err
 	}
 	return update, outboundOptions, nil
+}
+
+func filterRemoteProviderOutbounds(outbounds []option.Outbound, exclude *regexp.Regexp, include *regexp.Regexp) ([]option.Outbound, []parser.SkippedOutbound) {
+	filtered := make([]option.Outbound, 0, len(outbounds))
+	var skipped []parser.SkippedOutbound
+	for _, outbound := range outbounds {
+		var reason string
+		switch {
+		case outbound.Type == C.TypeTor:
+			reason = "forbidden by remote provider policy"
+		case exclude != nil && exclude.MatchString(outbound.Tag):
+			reason = "excluded by provider filter"
+		case include != nil && !include.MatchString(outbound.Tag):
+			reason = "not matched by provider include filter"
+		}
+		if reason != "" {
+			skipped = append(skipped, parser.SkippedOutbound{Tag: outbound.Tag, Type: outbound.Type, Reason: reason})
+			continue
+		}
+		filtered = append(filtered, outbound)
+	}
+	return filtered, skipped
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {

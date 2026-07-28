@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/provider/parser"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/require"
 )
@@ -162,4 +165,47 @@ func TestProviderUpdateRetryDelayBackoffAndLimit(t *testing.T) {
 	require.Equal(t, 30*time.Minute, providerUpdateRetryDelay(updateInterval, 6))
 	require.Equal(t, 30*time.Minute, providerUpdateRetryDelay(updateInterval, 20))
 	require.Equal(t, 5*time.Minute, providerUpdateRetryDelay(5*time.Minute, 10))
+}
+
+func TestFilterRemoteProviderOutboundsSkipsTor(t *testing.T) {
+	outbounds := []option.Outbound{
+		{Type: C.TypeTor, Tag: "tor", Options: &option.TorOutboundOptions{}},
+		{Type: C.TypeSOCKS, Tag: "socks", Options: &option.SOCKSOutboundOptions{}},
+	}
+
+	filtered, skipped := filterRemoteProviderOutbounds(outbounds, nil, nil)
+
+	require.Len(t, filtered, 1)
+	require.Equal(t, C.TypeSOCKS, filtered[0].Type)
+	require.Equal(t, "socks", filtered[0].Tag)
+	require.Equal(t, []parser.SkippedOutbound{{
+		Tag:    "tor",
+		Type:   C.TypeTor,
+		Reason: "forbidden by remote provider policy",
+	}}, skipped)
+}
+
+func TestFilterRemoteProviderOutboundsRejectsTorOnly(t *testing.T) {
+	filtered, _ := filterRemoteProviderOutbounds([]option.Outbound{{
+		Type:    C.TypeTor,
+		Tag:     "tor",
+		Options: &option.TorOutboundOptions{},
+	}}, nil, nil)
+
+	require.Error(t, parser.ValidateProviderOutbounds(filtered))
+}
+
+func TestFilterRemoteProviderOutboundsRejectsDependencyOnTor(t *testing.T) {
+	childOptions := &option.VLESSOutboundOptions{}
+	childOptions.Detour = "tor"
+	outbounds := []option.Outbound{
+		{Type: C.TypeTor, Tag: "tor", Options: &option.TorOutboundOptions{}},
+		{Type: C.TypeVLESS, Tag: "child", Options: childOptions},
+	}
+
+	filtered, skipped := filterRemoteProviderOutbounds(outbounds, nil, nil)
+	err := parser.ValidateSkippedDependencies(filtered, skipped)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "depends on skipped outbound tor")
 }
