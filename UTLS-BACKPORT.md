@@ -41,11 +41,15 @@ It is a custom build and must not be represented as the official v1.11.15 releas
    - Supports both client `utls.UConn` and server `utls.Conn` through the 1.11
      wrapper-unwrapping mechanism.
 
-6. `common/tls/reality_client_utls_test.go`
+6. TLS connection wrappers
+   - Marks transparent uTLS, REALITY, and badtls read/write layers as replaceable
+     so Vision can safely locate the underlying TLS connection.
+
+7. `common/tls/reality_client_utls_test.go`
    - Regression test ensuring REALITY cannot implement the generic
      `WithSessionIDGenerator` interface.
 
-7. `go.mod`, `go.sum`, `test/go.mod`, `test/go.sum`
+8. `go.mod`, `go.sum`, `test/go.mod`, `test/go.sum`
    - Removes the old `github.com/sagernet/utls` and
      `github.com/sagernet/reality` dependency paths.
    - Aligns Vision and ShadowTLS with MetaCubeX/uTLS-compatible releases.
@@ -87,6 +91,5 @@ broader 1.12 architecture and API changes rather than only the uTLS migration:
 - TLS fragment and TLS record fragment
 - the 1.12 ECH configuration redesign
 - Tailscale support
-- `ReaderReplaceable` / `WriterReplaceable` network wrapper APIs
 - the 1.12 DNS and domain-resolver redesign
 - removal of the separate `with_reality_server` tag
