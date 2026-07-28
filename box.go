@@ -89,7 +89,7 @@ func Context(
 	return ctx
 }
 
-func New(options Options) (*Box, error) {
+func New(options Options) (result *Box, err error) {
 	createdAt := time.Now()
 	ctx := options.Context
 	if ctx == nil {
@@ -157,6 +157,15 @@ func New(options Options) (*Box, error) {
 	inboundManager := inbound.NewManager(logFactory.NewLogger("inbound"), inboundRegistry, endpointManager)
 	outboundManager := outbound.NewManager(logFactory.NewLogger("outbound"), outboundRegistry, endpointManager, routeOptions.Final)
 	providerManager := provider.NewManager(logFactory.NewLogger("provider"), providerRegistry)
+	cleanupProviders := true
+	defer func() {
+		if !cleanupProviders {
+			return
+		}
+		err = E.Append(err, providerManager.Close(), func(closeErr error) error {
+			return E.Cause(closeErr, "cleanup providers after box initialization failure")
+		})
+	}()
 	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
@@ -343,7 +352,7 @@ func New(options Options) (*Box, error) {
 		timeService.TimeService = ntpService
 		services = append(services, adapter.NewLifecycleService(ntpService, "ntp service"))
 	}
-	return &Box{
+	result = &Box{
 		network:    networkManager,
 		endpoint:   endpointManager,
 		inbound:    inboundManager,
@@ -356,7 +365,9 @@ func New(options Options) (*Box, error) {
 		logger:     logFactory.Logger(),
 		services:   services,
 		done:       make(chan struct{}),
-	}, nil
+	}
+	cleanupProviders = false
+	return result, nil
 }
 
 func (s *Box) PreStart() error {
