@@ -418,6 +418,13 @@ func (s *Box) preStart() error {
 		return err
 	}
 	for _, currentOutbound := range s.outbound.Outbounds() {
+		if finalizer, loaded := currentOutbound.(interface {
+			FinalizeInitialSelection() error
+		}); loaded {
+			if err = finalizer.FinalizeInitialSelection(); err != nil {
+				return E.Cause(err, "finalize outbound group[", currentOutbound.Tag(), "]")
+			}
+		}
 		group, isGroup := currentOutbound.(adapter.OutboundGroup)
 		if isGroup && len(group.All()) == 0 {
 			return E.New("outbound group[", currentOutbound.Tag(), "] has no available outbound")

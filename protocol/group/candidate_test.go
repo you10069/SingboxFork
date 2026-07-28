@@ -4,16 +4,22 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"regexp"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	adapterOutbound "github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-dns"
+	L "github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/require"
 )
 
@@ -109,6 +115,60 @@ func (*candidateTestProvider) RegisterCallback(adapter.ProviderUpdateCallback) *
 	return nil
 }
 func (*candidateTestProvider) UnregisterCallback(*list.Element[adapter.ProviderUpdateCallback]) {}
+
+type selectorTestCacheFile struct {
+	selected map[string]string
+}
+
+func (*selectorTestCacheFile) Name() string                            { return "test-cache" }
+func (*selectorTestCacheFile) Start(adapter.StartStage) error          { return nil }
+func (*selectorTestCacheFile) Close() error                            { return nil }
+func (*selectorTestCacheFile) StoreFakeIP() bool                       { return false }
+func (*selectorTestCacheFile) FakeIPMetadata() *adapter.FakeIPMetadata { return nil }
+func (*selectorTestCacheFile) FakeIPSaveMetadata(*adapter.FakeIPMetadata) error {
+	return nil
+}
+func (*selectorTestCacheFile) FakeIPSaveMetadataAsync(*adapter.FakeIPMetadata) {}
+func (*selectorTestCacheFile) FakeIPStore(netip.Addr, string) error            { return nil }
+func (*selectorTestCacheFile) FakeIPStoreAsync(netip.Addr, string, L.Logger)   {}
+func (*selectorTestCacheFile) FakeIPLoad(netip.Addr) (string, bool)            { return "", false }
+func (*selectorTestCacheFile) FakeIPLoadDomain(string, bool) (netip.Addr, bool) {
+	return netip.Addr{}, false
+}
+func (*selectorTestCacheFile) FakeIPReset() error { return nil }
+func (*selectorTestCacheFile) StoreRDRC() bool    { return false }
+func (*selectorTestCacheFile) LoadRDRC(string, string, uint16) bool {
+	return false
+}
+func (*selectorTestCacheFile) SaveRDRC(string, string, uint16) error { return nil }
+func (*selectorTestCacheFile) SaveRDRCAsync(string, string, uint16, L.Logger) {
+}
+func (*selectorTestCacheFile) LoadMode() string                   { return "" }
+func (*selectorTestCacheFile) StoreMode(string) error             { return nil }
+func (c *selectorTestCacheFile) LoadSelected(group string) string { return c.selected[group] }
+func (c *selectorTestCacheFile) StoreSelected(group string, selected string) error {
+	c.selected[group] = selected
+	return nil
+}
+func (*selectorTestCacheFile) LoadGroupExpand(string) (bool, bool) { return false, false }
+func (*selectorTestCacheFile) StoreGroupExpand(string, bool) error { return nil }
+func (*selectorTestCacheFile) LoadRuleSet(string) *adapter.SavedBinary {
+	return nil
+}
+func (*selectorTestCacheFile) SaveRuleSet(string, *adapter.SavedBinary) error {
+	return nil
+}
+func (*selectorTestCacheFile) LoadSubscription(string) *adapter.SavedBinary {
+	return nil
+}
+func (*selectorTestCacheFile) SaveSubscription(string, *adapter.SavedBinary) error {
+	return nil
+}
+
+var (
+	_ adapter.CacheFile = (*selectorTestCacheFile)(nil)
+	_ dns.RDRCStore     = (*selectorTestCacheFile)(nil)
+)
 
 func TestCollectGroupOutboundsFilterScopes(t *testing.T) {
 	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
@@ -219,6 +279,7 @@ func TestSelectorProviderPreparationRebindsObjectByTag(t *testing.T) {
 	preparation.Commit()
 	require.Same(t, newNode, selector.selected.Load())
 	require.Equal(t, []string{"provider/node"}, selector.All())
+	require.False(t, selector.initialSelectionFinalized)
 }
 
 func TestSelectorProviderPreparationRejectsRuntimeEmptyGroup(t *testing.T) {
@@ -257,4 +318,185 @@ func TestSelectorConnectionHandlersKeepInterruptWrapper(t *testing.T) {
 	require.Same(t, selector, connectionManager.packetConnectionDialer)
 	require.True(t, connectionManager.connectionExternal)
 	require.True(t, connectionManager.packetExternal)
+}
+
+func TestSelectorStartRejectsMissingStaticDefault(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(direct),
+		staticTags:     []string{"direct"},
+		defaultTag:     "missing",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      make(map[string]adapter.Provider),
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	err := selector.Start()
+	require.EqualError(t, err, "default outbound not found: missing")
+	require.Equal(t, "direct", selector.Now())
+	require.False(t, selector.initialSelectionFinalized)
+}
+
+func TestSelectorProviderDefaultReplacesStartupFallback(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	defaultNode := &candidateTestOutbound{tag: "provider_default", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider"}
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(direct),
+		staticTags:     []string{"direct"},
+		providerTags:   []string{"provider"},
+		defaultTag:     "provider_default",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      map[string]adapter.Provider{"provider": provider},
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	require.NoError(t, selector.rebuild(nil))
+	require.Equal(t, "direct", selector.Now())
+	require.False(t, selector.initialSelectionFinalized)
+
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{defaultNode})
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = []adapter.Outbound{defaultNode}
+	require.Equal(t, "provider_default", selector.Now())
+
+	require.NoError(t, selector.FinalizeInitialSelection())
+	require.True(t, selector.initialSelectionFinalized)
+	require.Equal(t, "provider_default", selector.Now())
+}
+
+func TestSelectorCachedProviderSelectionIsOnlyPendingDuringStartup(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	defaultNode := &candidateTestOutbound{tag: "proxy-a", typeName: "vless"}
+	cachedNode := &candidateTestOutbound{tag: "provider_proxy-b", typeName: "vless"}
+	recreatedCachedNode := &candidateTestOutbound{tag: "provider_proxy-b", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider"}
+	cacheFile := &selectorTestCacheFile{selected: map[string]string{"selector": "provider_proxy-b"}}
+	ctx := service.ContextWith[adapter.CacheFile](context.Background(), cacheFile)
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            ctx,
+		outbound:       newCandidateTestManager(direct, defaultNode),
+		staticTags:     []string{"direct", "proxy-a"},
+		providerTags:   []string{"provider"},
+		defaultTag:     "proxy-a",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      map[string]adapter.Provider{"provider": provider},
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	require.NoError(t, selector.rebuild(nil))
+	require.Equal(t, "proxy-a", selector.Now())
+
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{cachedNode})
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = []adapter.Outbound{cachedNode}
+	require.Equal(t, "provider_proxy-b", selector.Now())
+
+	require.NoError(t, selector.FinalizeInitialSelection())
+	require.True(t, selector.initialSelectionFinalized)
+
+	preparation, err = selector.prepareProviderUpdated("provider", nil)
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = nil
+	require.Equal(t, "proxy-a", selector.Now())
+
+	preparation, err = selector.prepareProviderUpdated("provider", []adapter.Outbound{recreatedCachedNode})
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = []adapter.Outbound{recreatedCachedNode}
+	require.Equal(t, "proxy-a", selector.Now())
+}
+
+func TestSelectorMissingCachedSelectionFallsBackToDefaultAtStartup(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	defaultNode := &candidateTestOutbound{tag: "proxy-a", typeName: "vless"}
+	cachedNode := &candidateTestOutbound{tag: "provider_proxy-b", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider"}
+	cacheFile := &selectorTestCacheFile{selected: map[string]string{"selector": "provider_proxy-b"}}
+	ctx := service.ContextWith[adapter.CacheFile](context.Background(), cacheFile)
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            ctx,
+		outbound:       newCandidateTestManager(direct, defaultNode),
+		staticTags:     []string{"direct", "proxy-a"},
+		providerTags:   []string{"provider"},
+		defaultTag:     "proxy-a",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      map[string]adapter.Provider{"provider": provider},
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	require.NoError(t, selector.rebuild(nil))
+	require.Equal(t, "proxy-a", selector.Now())
+	require.NoError(t, selector.FinalizeInitialSelection())
+	require.True(t, selector.initialSelectionFinalized)
+
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{cachedNode})
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = []adapter.Outbound{cachedNode}
+	require.Equal(t, "proxy-a", selector.Now())
+}
+
+func TestSelectorManualStartupSelectionCancelsPendingDefault(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	defaultNode := &candidateTestOutbound{tag: "provider_default", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider"}
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(direct),
+		staticTags:     []string{"direct"},
+		providerTags:   []string{"provider"},
+		defaultTag:     "provider_default",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      map[string]adapter.Provider{"provider": provider},
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	require.NoError(t, selector.rebuild(nil))
+	require.Equal(t, "direct", selector.Now())
+	require.True(t, selector.SelectOutbound("direct"))
+	require.True(t, selector.initialSelectionFinalized)
+
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{defaultNode})
+	require.NoError(t, err)
+	preparation.Commit()
+	provider.outbounds = []adapter.Outbound{defaultNode}
+	require.Equal(t, "direct", selector.Now())
+	require.NoError(t, selector.FinalizeInitialSelection())
+	require.Equal(t, "direct", selector.Now())
+}
+
+func TestSelectorAbortedProviderPreparationKeepsStartupSelectionPending(t *testing.T) {
+	direct := &candidateTestOutbound{tag: "direct", typeName: "direct"}
+	defaultNode := &candidateTestOutbound{tag: "provider_default", typeName: "vless"}
+	provider := &candidateTestProvider{tag: "provider"}
+	selector := &Selector{
+		Adapter:        adapterOutbound.NewAdapter(C.TypeSelector, "selector", nil, nil),
+		ctx:            context.Background(),
+		outbound:       newCandidateTestManager(direct),
+		staticTags:     []string{"direct"},
+		providerTags:   []string{"provider"},
+		defaultTag:     "provider_default",
+		outbounds:      make(map[string]adapter.Outbound),
+		providers:      map[string]adapter.Provider{"provider": provider},
+		interruptGroup: interrupt.NewGroup(),
+	}
+
+	require.NoError(t, selector.rebuild(nil))
+	preparation, err := selector.prepareProviderUpdated("provider", []adapter.Outbound{defaultNode})
+	require.NoError(t, err)
+	preparation.Abort()
+
+	require.Equal(t, "direct", selector.Now())
+	require.False(t, selector.initialSelectionFinalized)
 }

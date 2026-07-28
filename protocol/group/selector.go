@@ -63,6 +63,7 @@ type Selector struct {
 	providers                    map[string]adapter.Provider
 	callbacks                    []providerCallback
 	selected                     atomic.TypedValue[adapter.Outbound]
+	initialSelectionFinalized    bool
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 }
@@ -147,7 +148,18 @@ func (s *Selector) Start() error {
 			s.callbacks = append(s.callbacks, callback)
 		}
 	}
-	return s.rebuild(nil)
+	err := s.rebuild(nil)
+	if err != nil {
+		return err
+	}
+	if len(s.providers) == 0 {
+		return s.FinalizeInitialSelection()
+	}
+	return nil
+}
+
+func (s *Selector) PostStart() error {
+	return s.FinalizeInitialSelection()
 }
 
 func (s *Selector) Close() error {
@@ -185,6 +197,7 @@ func (s *Selector) SelectOutbound(tag string) bool {
 	if !loaded {
 		return false
 	}
+	s.initialSelectionFinalized = true
 	if s.selected.Swap(detour) == detour {
 		return true
 	}
@@ -262,6 +275,23 @@ type selectorState struct {
 	oldSelected adapter.Outbound
 }
 
+// FinalizeInitialSelection resolves the startup cache/default selection after
+// all configured providers have completed their initial load.
+func (s *Selector) FinalizeInitialSelection() error {
+	s.rebuildAccess.Lock()
+	defer s.rebuildAccess.Unlock()
+	if s.initialSelectionFinalized {
+		return nil
+	}
+	state, err := s.buildState(nil, true)
+	if err != nil {
+		return err
+	}
+	s.applyState(state)
+	s.initialSelectionFinalized = true
+	return nil
+}
+
 type selectorProviderUpdatePreparation struct {
 	selector *Selector
 	state    selectorState
@@ -290,7 +320,7 @@ func (s *Selector) prepareProviderUpdated(tag string, outbounds []adapter.Outbou
 		return nil, E.New("outbound provider not found: ", tag)
 	}
 	s.rebuildAccess.Lock()
-	state, err := s.buildState(map[string][]adapter.Outbound{tag: outbounds})
+	state, err := s.buildState(map[string][]adapter.Outbound{tag: outbounds}, false)
 	if err != nil {
 		s.rebuildAccess.Unlock()
 		return nil, err
@@ -308,7 +338,7 @@ func (s *Selector) prepareProviderUpdated(tag string, outbounds []adapter.Outbou
 func (s *Selector) rebuild(providerOverrides map[string][]adapter.Outbound) error {
 	s.rebuildAccess.Lock()
 	defer s.rebuildAccess.Unlock()
-	state, err := s.buildState(providerOverrides)
+	state, err := s.buildState(providerOverrides, false)
 	if err != nil {
 		return err
 	}
@@ -316,7 +346,7 @@ func (s *Selector) rebuild(providerOverrides map[string][]adapter.Outbound) erro
 	return nil
 }
 
-func (s *Selector) buildState(providerOverrides map[string][]adapter.Outbound) (selectorState, error) {
+func (s *Selector) buildState(providerOverrides map[string][]adapter.Outbound, validateDefault bool) (selectorState, error) {
 	collected, tags, err := collectGroupOutbounds(
 		s.outbound,
 		s.Tag(),
@@ -343,6 +373,11 @@ func (s *Selector) buildState(providerOverrides map[string][]adapter.Outbound) (
 
 	oldSelected := s.selected.Load()
 	selected := oldSelected
+	if !s.initialSelectionFinalized {
+		// The current object may only be a temporary startup fallback while
+		// cache/default nodes are still waiting for their providers.
+		selected = nil
+	}
 	if selected != nil {
 		selected = outbounds[selected.Tag()]
 	}
@@ -353,6 +388,9 @@ func (s *Selector) buildState(providerOverrides map[string][]adapter.Outbound) (
 	}
 	if selected == nil && s.defaultTag != "" {
 		selected = outbounds[s.defaultTag]
+		if selected == nil && validateDefault {
+			return selectorState{}, E.New("default outbound not found: ", s.defaultTag)
+		}
 	}
 	if selected == nil && len(tags) > 0 {
 		selected = outbounds[tags[0]]
