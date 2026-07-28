@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"regexp"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -43,13 +44,14 @@ type Selector struct {
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
+	tags := selectorOutboundTags(ctx, tag, options)
 	outbound := &Selector{
-		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, nil, options.Outbounds),
+		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, nil, tags),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
-		tags:                         options.Outbounds,
+		tags:                         tags,
 		defaultTag:                   options.Default,
 		outbounds:                    make(map[string]adapter.Outbound),
 		interruptGroup:               interrupt.NewGroup(),
@@ -59,6 +61,52 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("missing tags")
 	}
 	return outbound, nil
+}
+
+func selectorOutboundTags(ctx context.Context, selectorTag string, options option.SelectorOutboundOptions) []string {
+	tags := append([]string(nil), options.Outbounds...)
+	if !options.IncludeAllOutbounds {
+		return tags
+	}
+
+	var include *regexp.Regexp
+	if options.Include != nil {
+		include = options.Include.Build()
+	}
+	var exclude *regexp.Regexp
+	if options.Exclude != nil {
+		exclude = options.Exclude.Build()
+	}
+	var excludeType *regexp.Regexp
+	if options.ExcludeType != nil {
+		excludeType = options.ExcludeType.Build()
+	}
+
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		seen[tag] = struct{}{}
+	}
+	metadata := service.FromContext[adapter.StaticOutboundMetadata](ctx)
+	for _, candidate := range metadata.Outbounds {
+		if candidate.Tag == "" || candidate.Tag == selectorTag {
+			continue
+		}
+		if _, loaded := seen[candidate.Tag]; loaded {
+			continue
+		}
+		if include != nil && !include.MatchString(candidate.Tag) {
+			continue
+		}
+		if exclude != nil && exclude.MatchString(candidate.Tag) {
+			continue
+		}
+		if excludeType != nil && excludeType.MatchString(candidate.Type) {
+			continue
+		}
+		seen[candidate.Tag] = struct{}{}
+		tags = append(tags, candidate.Tag)
+	}
+	return tags
 }
 
 func (s *Selector) Network() []string {

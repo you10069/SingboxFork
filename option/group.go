@@ -3,9 +3,13 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type SelectorOutboundOptions struct {
-	Outbounds                 []string `json:"outbounds"`
-	Default                   string   `json:"default,omitempty"`
-	InterruptExistConnections bool     `json:"interrupt_exist_connections,omitempty"`
+	Outbounds                 []string          `json:"outbounds"`
+	IncludeAllOutbounds       bool              `json:"include_all_outbounds,omitempty"`
+	Include                   *badoption.Regexp `json:"include,omitempty"`
+	Exclude                   *badoption.Regexp `json:"exclude,omitempty"`
+	ExcludeType               *badoption.Regexp `json:"exclude_type,omitempty"`
+	Default                   string            `json:"default,omitempty"`
+	InterruptExistConnections bool              `json:"interrupt_exist_connections,omitempty"`
 }
 
 type URLTestOutboundOptions struct {

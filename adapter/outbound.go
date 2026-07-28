@@ -18,6 +18,19 @@ type Outbound interface {
 	N.Dialer
 }
 
+// StaticOutboundMetadata contains ordinary outbounds declared directly in the
+// main configuration. Group and DNS outbounds are intentionally excluded so
+// automatic collection cannot create self references, group cycles, or select
+// the special DNS outbound as a traffic proxy.
+type StaticOutboundMetadata struct {
+	Outbounds []StaticOutboundMetadataItem
+}
+
+type StaticOutboundMetadataItem struct {
+	Tag  string
+	Type string
+}
+
 type OutboundRegistry interface {
 	option.OutboundOptionsRegistry
 	CreateOutbound(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) (Outbound, error)

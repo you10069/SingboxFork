@@ -182,6 +182,24 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
 	service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportManager)
 	service.MustRegister[adapter.ServiceManager](ctx, serviceManager)
+	staticOutboundMetadata := adapter.StaticOutboundMetadata{
+		Outbounds: make([]adapter.StaticOutboundMetadataItem, 0, len(options.Outbounds)),
+	}
+	for index, outboundOptions := range options.Outbounds {
+		switch outboundOptions.Type {
+		case C.TypeSelector, C.TypeURLTest, C.TypeDNS:
+			continue
+		}
+		tag := outboundOptions.Tag
+		if tag == "" {
+			tag = F.ToString(index)
+		}
+		staticOutboundMetadata.Outbounds = append(staticOutboundMetadata.Outbounds, adapter.StaticOutboundMetadataItem{
+			Tag:  tag,
+			Type: outboundOptions.Type,
+		})
+	}
+	service.MustRegister[adapter.StaticOutboundMetadata](ctx, staticOutboundMetadata)
 	dnsRouter := dns.NewRouter(ctx, logFactory, dnsOptions)
 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions)
