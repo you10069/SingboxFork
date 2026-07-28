@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/common/interrupt"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-dns"
 	L "github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -37,6 +38,39 @@ func (o *candidateTestOutbound) DialContext(context.Context, string, M.Socksaddr
 }
 func (o *candidateTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("not implemented")
+}
+
+func TestSelectorRejectsDuplicateProviderTags(t *testing.T) {
+	_, err := NewSelector(context.Background(), nil, nil, "selector", option.SelectorOutboundOptions{
+		GroupCommonOptions: option.GroupCommonOptions{
+			Providers: []string{"provider", "provider"},
+		},
+	})
+	require.EqualError(t, err, "duplicate outbound provider tag: provider")
+}
+
+func TestURLTestRejectsDuplicateProviderTags(t *testing.T) {
+	_, err := NewURLTest(context.Background(), nil, nil, "urltest", option.URLTestOutboundOptions{
+		GroupCommonOptions: option.GroupCommonOptions{
+			Providers: []string{"provider", "provider"},
+		},
+	})
+	require.EqualError(t, err, "duplicate outbound provider tag: provider")
+}
+
+func TestUseAllProvidersIgnoresExplicitDuplicateProviderTags(t *testing.T) {
+	groupOptions := option.GroupCommonOptions{
+		Providers:       []string{"provider", "provider"},
+		UseAllProviders: true,
+	}
+	_, err := NewSelector(context.Background(), nil, nil, "selector", option.SelectorOutboundOptions{
+		GroupCommonOptions: groupOptions,
+	})
+	require.NoError(t, err)
+	_, err = NewURLTest(context.Background(), nil, nil, "urltest", option.URLTestOutboundOptions{
+		GroupCommonOptions: groupOptions,
+	})
+	require.NoError(t, err)
 }
 
 type candidateTestManager struct {

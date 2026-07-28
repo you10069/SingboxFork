@@ -71,6 +71,11 @@ type Selector struct {
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
 	includeAllOutbounds := options.IncludeAll || options.IncludeAllOutbounds
 	useAllProviders := options.IncludeAll || options.UseAllProviders
+	if !useAllProviders {
+		if err := validateGroupProviderTags(options.Providers); err != nil {
+			return nil, err
+		}
+	}
 	var automaticStaticTags []string
 	if includeAllOutbounds {
 		metadata := service.FromContext[adapter.StaticOutboundMetadata](ctx)

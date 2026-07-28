@@ -21,6 +21,17 @@ type groupCandidate struct {
 	explicit bool
 }
 
+func validateGroupProviderTags(providerTags []string) error {
+	seen := make(map[string]struct{}, len(providerTags))
+	for _, tag := range providerTags {
+		if _, exists := seen[tag]; exists {
+			return E.New("duplicate outbound provider tag: ", tag)
+		}
+		seen[tag] = struct{}{}
+	}
+	return nil
+}
+
 func collectGroupOutbounds(
 	manager adapter.OutboundManager,
 	groupTag string,
